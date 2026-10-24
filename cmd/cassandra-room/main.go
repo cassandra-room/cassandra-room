@@ -41,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", *addr, err)
 	}
-	log.Printf("cassandra-room listening for CQL v3/v4 connections on %s", ln.Addr())
+	log.Printf("cassandra-room listening for CQL v3/v4/v5 connections on %s", ln.Addr())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
