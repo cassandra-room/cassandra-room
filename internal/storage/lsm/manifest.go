@@ -43,6 +43,10 @@ type fileMeta struct {
 	size              uint64
 	smallest, largest pebble.InternalKey
 	minSeq, maxSeq    uint64
+	// minTS and maxTS are the smallest and largest write timestamps in the
+	// table (Cassandra's Statistics.db min/max timestamp). Reads skip tables
+	// whose data is all older than a row deletion already found.
+	minTS, maxTS int64
 
 	// reader is set while the table is open; it is not part of the manifest.
 	reader *tableReader
@@ -71,7 +75,7 @@ const (
 	tagNextFileNum = 1
 	tagLastSeq     = 2
 	tagMinWAL      = 3
-	tagAddFile     = 4 // table, num, size, minSeq, maxSeq, smallest, largest
+	tagAddFile     = 4 // table, num, size, minSeq, maxSeq, minTS, maxTS, smallest, largest
 	tagDeleteFile  = 5 // table, num
 	tagCreateTable = 6 // table
 	tagDropTable   = 7 // table
@@ -101,6 +105,8 @@ func (e *versionEdit) encode() []byte {
 		}
 		for _, f := range t.added {
 			put(tagAddFile, id, f.num, f.size, f.minSeq, f.maxSeq)
+			b = binary.AppendVarint(b, f.minTS)
+			b = binary.AppendVarint(b, f.maxTS)
 			b = appendInternalKey(b, f.smallest)
 			b = appendInternalKey(b, f.largest)
 		}
@@ -131,6 +137,18 @@ func decodeVersionEdit(b []byte) (*versionEdit, error) {
 			return 0
 		}
 		v, n := binary.Uvarint(b)
+		if n <= 0 {
+			err = errCorruptManifest
+			return 0
+		}
+		b = b[n:]
+		return v
+	}
+	readVarint := func() int64 {
+		if err != nil {
+			return 0
+		}
+		v, n := binary.Varint(b)
 		if n <= 0 {
 			err = errCorruptManifest
 			return 0
@@ -182,6 +200,8 @@ func decodeVersionEdit(b []byte) (*versionEdit, error) {
 		case tagAddFile:
 			t := tableEditFor(TableID(readNum()))
 			f := &fileMeta{num: readNum(), size: readNum(), minSeq: readNum(), maxSeq: readNum()}
+			f.minTS = readVarint()
+			f.maxTS = readVarint()
 			f.smallest = readKey()
 			f.largest = readKey()
 			t.added = append(t.added, f)

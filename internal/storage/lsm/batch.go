@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -15,14 +16,18 @@ const batchHeaderLen = 12
 var errCorruptBatch = errors.New("lsm: corrupt batch")
 
 // Batch is a set of writes, possibly to several tables, applied atomically by
-// Engine.Apply. Its encoding is also the WAL record format:
+// Engine.Apply. Every write is a row fragment (a Pebble MERGE entry) that is
+// reconciled with the row's other fragments by the engine's Merger. Its
+// encoding is also the WAL record format:
 //
 //	header: seqnum uint64 | count uint32
-//	entry:  kind byte | uvarint table | uvarint keyLen | key | (SET only) uvarint valueLen | value
+//	entry:  kind byte | uvarint table | uvarint keyLen | key | uvarint valueLen | value
 type Batch struct {
 	data   []byte
 	count  uint32
 	tables []TableID // distinct tables written, in first-use order
+	// ps is used by Engine.Apply for a synced write, saving an allocation.
+	ps pendingSync
 }
 
 // NewBatch returns an empty batch.
@@ -30,25 +35,18 @@ func NewBatch() *Batch {
 	return &Batch{data: make([]byte, batchHeaderLen, 256)}
 }
 
-// Set adds a write of key with value to table.
-func (b *Batch) Set(table TableID, key, value []byte) {
-	b.add(pebble.InternalKeyKindSet, table, key, value)
-}
+var batchPool = sync.Pool{New: func() any { return NewBatch() }}
 
-// Delete adds a deletion of key from table.
-func (b *Batch) Delete(table TableID, key []byte) {
-	b.add(pebble.InternalKeyKindDelete, table, key, nil)
-}
-
-func (b *Batch) add(kind pebble.InternalKeyKind, table TableID, key, value []byte) {
-	b.data = append(b.data, byte(kind))
+// Put adds a row fragment for key in table. Deletions are fragments too
+// (tombstone cells or a row deletion); Pebble's DELETE kinds are never used
+// for user data, because they shadow by arrival order, not by timestamp.
+func (b *Batch) Put(table TableID, key, value []byte) {
+	b.data = append(b.data, byte(pebble.InternalKeyKindMerge))
 	b.data = binary.AppendUvarint(b.data, uint64(table))
 	b.data = binary.AppendUvarint(b.data, uint64(len(key)))
 	b.data = append(b.data, key...)
-	if kind == pebble.InternalKeyKindSet {
-		b.data = binary.AppendUvarint(b.data, uint64(len(value)))
-		b.data = append(b.data, value...)
-	}
+	b.data = binary.AppendUvarint(b.data, uint64(len(value)))
+	b.data = append(b.data, value...)
 	b.count++
 	if !slices.Contains(b.tables, table) {
 		b.tables = append(b.tables, table)
@@ -111,17 +109,14 @@ func (r *batchReader) next() (e batchEntry, ok bool, err error) {
 	}
 	e.table = TableID(table)
 	r.data = r.data[n:]
+	if e.kind != pebble.InternalKeyKindMerge {
+		return batchEntry{}, false, errCorruptBatch
+	}
 	if e.key, err = r.readBytes(); err != nil {
 		return batchEntry{}, false, err
 	}
-	switch e.kind {
-	case pebble.InternalKeyKindSet:
-		if e.value, err = r.readBytes(); err != nil {
-			return batchEntry{}, false, err
-		}
-	case pebble.InternalKeyKindDelete:
-	default:
-		return batchEntry{}, false, errCorruptBatch
+	if e.value, err = r.readBytes(); err != nil {
+		return batchEntry{}, false, err
 	}
 	return e, true, nil
 }

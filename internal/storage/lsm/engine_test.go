@@ -1,40 +1,71 @@
 package lsm
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
 
-func mustGet(t *testing.T, tbl *Table, key, want string) {
+// testTS issues increasing timestamps, so in tests that do not exercise
+// out-of-order writes the latest write wins, as with key-value semantics.
+var testTS atomic.Int64
+
+func cellRow(ts int64, value string, tomb bool) []byte {
+	c := row.Cell{Column: 1, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime, Value: []byte(value)}
+	if tomb {
+		c = row.Cell{Column: 1, Timestamp: ts, LocalDeletionTime: 1}
+	}
+	return row.Append(nil, &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: row.NoTimestamp}, Cells: []row.Cell{c}})
+}
+
+// getVal returns the live value of column 1 of key, or ok=false.
+func getVal(t *testing.T, tbl *Table, key string) (string, bool) {
 	t.Helper()
 	v, err := tbl.Get([]byte(key))
+	if errors.Is(err, ErrNotFound) {
+		return "", false
+	}
 	require.NoError(t, err, "key %q", key)
-	require.Equal(t, want, string(v), "key %q", key)
+	r, err := row.Decode(v)
+	require.NoError(t, err)
+	for _, c := range r.Live(0) {
+		if c.Column == 1 {
+			return string(c.Value), true
+		}
+	}
+	return "", false
+}
+
+func mustGet(t *testing.T, tbl *Table, key, want string) {
+	t.Helper()
+	got, ok := getVal(t, tbl, key)
+	require.True(t, ok, "key %q not found", key)
+	require.Equal(t, want, got, "key %q", key)
 }
 
 func mustNotFound(t *testing.T, tbl *Table, key string) {
 	t.Helper()
-	_, err := tbl.Get([]byte(key))
-	require.ErrorIs(t, err, ErrNotFound, "key %q", key)
+	_, ok := getVal(t, tbl, key)
+	require.False(t, ok, "key %q", key)
 }
 
 func set(t *testing.T, e *Engine, id TableID, key, value string, wo *WriteOptions) {
 	t.Helper()
-	b := NewBatch()
-	b.Set(id, []byte(key), []byte(value))
-	require.NoError(t, e.Apply(b, wo))
+	require.NoError(t, e.Put(id, []byte(key), cellRow(testTS.Add(1), value, false), wo))
 }
 
 func del(t *testing.T, e *Engine, id TableID, key string) {
 	t.Helper()
-	b := NewBatch()
-	b.Delete(id, []byte(key))
-	require.NoError(t, e.Apply(b, NoSync))
+	require.NoError(t, e.Put(id, []byte(key), cellRow(testTS.Add(1), "", true), NoSync))
 }
 
 func tableFiles(e *Engine, id TableID) int {
@@ -78,14 +109,14 @@ func TestBasic(t *testing.T) {
 	// A batch across tables is atomic and rejected as a whole if any table
 	// is unknown.
 	batch := NewBatch()
-	batch.Set(1, []byte("x"), []byte("1"))
-	batch.Set(2, []byte("y"), []byte("2"))
+	batch.Put(1, []byte("x"), cellRow(testTS.Add(1), "1", false))
+	batch.Put(2, []byte("y"), cellRow(testTS.Add(1), "2", false))
 	require.NoError(t, e.Apply(batch, Sync))
 	mustGet(t, a, "x", "1")
 	mustGet(t, b, "y", "2")
 	bad := NewBatch()
-	bad.Set(1, []byte("z"), []byte("1"))
-	bad.Set(99, []byte("z"), []byte("1"))
+	bad.Put(1, []byte("z"), cellRow(testTS.Add(1), "1", false))
+	bad.Put(99, []byte("z"), cellRow(testTS.Add(1), "1", false))
 	require.ErrorIs(t, e.Apply(bad, NoSync), ErrUnknownTable)
 	mustNotFound(t, a, "z")
 }
@@ -332,14 +363,12 @@ func TestCrashRecovery(t *testing.T) {
 			for k, v := range written {
 				tbl, err := e2.Table(k.id)
 				require.NoError(t, err)
-				got, err := tbl.Get([]byte(k.key))
+				got, ok := getVal(t, tbl, k.key)
 				if _, mustExist := synced[k]; mustExist {
-					require.NoError(t, err, "synced key %v", k)
+					require.True(t, ok, "synced key %v", k)
 				}
-				if err == nil {
-					require.Equal(t, v, string(got), "key %v", k)
-				} else {
-					require.ErrorIs(t, err, ErrNotFound)
+				if ok {
+					require.Equal(t, v, got, "key %v", k)
 				}
 			}
 			require.NoError(t, e2.Close())
@@ -390,8 +419,13 @@ func TestConcurrentReadWrite(t *testing.T) {
 					t.Error(err)
 					return
 				}
+				r, err := row.Decode(v)
+				if err != nil || len(r.Cells) != 1 {
+					t.Errorf("bad row %v %v", r, err)
+					return
+				}
 				var n int
-				fmt.Sscanf(string(v), "%d", &n)
+				fmt.Sscanf(string(r.Cells[0].Value), "%d", &n)
 				if n < seen[k] {
 					t.Errorf("key %d went backwards: %d after %d", k, n, seen[k])
 					return
@@ -401,9 +435,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 		}(r)
 	}
 	for i := 1; i <= 20000; i++ {
-		b := NewBatch()
-		b.Set(TableID(1+i%2), []byte(fmt.Sprintf("k%03d", i%keys)), []byte(fmt.Sprintf("%d", i)))
-		require.NoError(t, e.Apply(b, NoSync))
+		require.NoError(t, e.Put(TableID(1+i%2), []byte(fmt.Sprintf("k%03d", i%keys)), cellRow(int64(i), fmt.Sprint(i), false), NoSync))
 	}
 	require.NoError(t, e.Flush())
 	close(done)
@@ -418,45 +450,143 @@ func TestClosedAndLocked(t *testing.T) {
 	_, err = Open("db", &Options{FS: fs})
 	require.Error(t, err, "a second Open must fail while the engine is locked")
 	require.NoError(t, e.Close())
-	b := NewBatch()
-	b.Set(1, []byte("a"), nil)
-	require.ErrorIs(t, e.Apply(b, NoSync), ErrClosed)
+	require.ErrorIs(t, e.Put(1, []byte("a"), cellRow(1, "a", false), NoSync), ErrClosed)
 	require.ErrorIs(t, e.Close(), ErrClosed)
 }
 
-func BenchmarkSet(b *testing.B) {
+// TestTimestampSemantics checks Cassandra's last-write-wins by timestamp
+// across memtables and sstables: arrival order does not matter.
+func TestTimestampSemantics(t *testing.T) {
 	e, err := Open("db", &Options{FS: vfs.NewMem()})
-	require.NoError(b, err)
+	require.NoError(t, err)
 	defer e.Close()
-	_, _ = e.CreateTable(1)
-	val := make([]byte, 100)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		batch := NewBatch()
-		batch.Set(1, []byte(fmt.Sprintf("key%012d", i)), val)
-		if err := e.Apply(batch, NoSync); err != nil {
-			b.Fatal(err)
+	tbl, _ := e.CreateTable(1)
+	put := func(key string, r *row.Row) {
+		if r.Deletion == (row.Deletion{}) {
+			r.Deletion.MarkedForDeleteAt = row.NoTimestamp
+		}
+		require.NoError(t, e.Put(1, []byte(key), row.Append(nil, r), NoSync))
+	}
+	cell := func(col uint32, ts int64, v string) row.Cell {
+		return row.Cell{Column: col, Timestamp: ts, LocalDeletionTime: row.NoDeletionTime, Value: []byte(v)}
+	}
+	read := func(key string) *row.Row {
+		v, err := tbl.Get([]byte(key))
+		require.NoError(t, err)
+		r, err := row.Decode(v)
+		require.NoError(t, err)
+		return r
+	}
+
+	// A newer write that arrives first is not overwritten by an older one,
+	// whether they meet in the memtable or across an sstable.
+	put("a", &row.Row{Cells: []row.Cell{cell(1, 20, "new")}})
+	require.NoError(t, tbl.Flush())
+	put("a", &row.Row{Cells: []row.Cell{cell(1, 10, "old")}})
+	require.Equal(t, []row.Cell{cell(1, 20, "new")}, read("a").Cells)
+
+	// An older tombstone arriving later does not delete newer data.
+	put("a", &row.Row{Cells: []row.Cell{{Column: 1, Timestamp: 15, LocalDeletionTime: 1}}})
+	require.Equal(t, []row.Cell{cell(1, 20, "new")}, read("a").Cells)
+
+	// Writes to different columns merge (an upsert), across sstables.
+	put("b", &row.Row{Cells: []row.Cell{cell(1, 5, "x")}})
+	require.NoError(t, tbl.Flush())
+	put("b", &row.Row{Cells: []row.Cell{cell(2, 6, "y")}})
+	require.Equal(t, []row.Cell{cell(1, 5, "x"), cell(2, 6, "y")}, read("b").Cells)
+
+	// A row deletion shadows older cells in every sstable; newer cells
+	// survive. The read stops at sstables entirely older than the deletion.
+	put("c", &row.Row{Cells: []row.Cell{cell(1, 1, "v1")}})
+	require.NoError(t, tbl.Flush())
+	put("c", &row.Row{Cells: []row.Cell{cell(2, 2, "v2")}})
+	require.NoError(t, tbl.Flush())
+	put("c", &row.Row{Deletion: row.Deletion{MarkedForDeleteAt: 50, LocalDeletionTime: 1}})
+	put("c", &row.Row{Cells: []row.Cell{cell(3, 60, "after")}})
+	r := read("c")
+	require.Equal(t, int64(50), r.Deletion.MarkedForDeleteAt)
+	require.Equal(t, []row.Cell{cell(3, 60, "after")}, r.Cells)
+}
+
+// TestConcurrentWriters runs several writers against two tables while
+// memtables are flushed, and checks the final contents against a model.
+// Each writer owns its keys, so the expected value of every key is known.
+func TestConcurrentWriters(t *testing.T) {
+	e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 64 << 10})
+	require.NoError(t, err)
+	defer e.Close()
+	for _, id := range []TableID{1, 2} {
+		_, err := e.CreateTable(id)
+		require.NoError(t, err)
+	}
+	const writers, perWriter = 8, 2000
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				b := NewBatch()
+				key := []byte(fmt.Sprintf("w%d-k%03d", w, i%100))
+				val := cellRow(int64(i), fmt.Sprint(i), false)
+				b.Put(1, key, val) // one batch writes both tables
+				b.Put(2, key, val)
+				wo := NoSync
+				if i%50 == 0 {
+					wo = Sync
+				}
+				if err := e.Apply(b, wo); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	require.NoError(t, e.Flush())
+	for _, id := range []TableID{1, 2} {
+		tbl, _ := e.Table(id)
+		for w := 0; w < writers; w++ {
+			for k := 0; k < 100; k++ {
+				// The last write to key k is i = perWriter-100+k.
+				mustGet(t, tbl, fmt.Sprintf("w%d-k%03d", w, k), fmt.Sprint(perWriter-100+k))
+			}
 		}
 	}
 }
 
-func BenchmarkGetFromTables(b *testing.B) {
-	e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 3 << 20})
-	require.NoError(b, err)
+// TestPeriodicSync checks Cassandra's default periodic commit log mode: NoSync
+// writes become durable at the next periodic sync.
+func TestPeriodicSync(t *testing.T) {
+	fs := vfs.NewCrashableMem()
+	e, err := Open("db", &Options{FS: fs, WALSyncPeriod: -1})
+	require.NoError(t, err)
+	_, _ = e.CreateTable(1)
+	set(t, e, 1, "a", "1", NoSync)
+	require.NoError(t, e.SyncWAL()) // what the periodic syncer does
+	set(t, e, 1, "b", "2", NoSync)  // not synced
+	crashed := fs.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	require.NoError(t, e.Close())
+
+	e, err = Open("db", &Options{FS: crashed})
+	require.NoError(t, err)
 	defer e.Close()
-	tbl, _ := e.CreateTable(1)
-	const n = 100000
-	val := make([]byte, 100)
-	for i := 0; i < n; i++ {
-		batch := NewBatch()
-		batch.Set(1, []byte(fmt.Sprintf("key%012d", i)), val)
-		require.NoError(b, e.Apply(batch, NoSync))
-	}
-	require.NoError(b, e.Flush())
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := tbl.Get([]byte(fmt.Sprintf("key%012d", (i*7919)%n))); err != nil {
-			b.Fatal(err)
-		}
-	}
+	tbl, _ := e.Table(1)
+	mustGet(t, tbl, "a", "1")
+	mustNotFound(t, tbl, "b")
+
+	// The background syncer runs on its own.
+	e2fs := vfs.NewCrashableMem()
+	e2, err := Open("db", &Options{FS: e2fs, WALSyncPeriod: 10 * time.Millisecond})
+	require.NoError(t, err)
+	_, _ = e2.CreateTable(1)
+	set(t, e2, 1, "c", "3", NoSync)
+	time.Sleep(100 * time.Millisecond)
+	crashed2 := e2fs.CrashClone(vfs.CrashCloneCfg{UnsyncedDataPercent: 0})
+	require.NoError(t, e2.Close())
+	e3, err := Open("db", &Options{FS: crashed2})
+	require.NoError(t, err)
+	defer e3.Close()
+	tbl3, _ := e3.Table(1)
+	mustGet(t, tbl3, "c", "3")
 }

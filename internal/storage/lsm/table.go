@@ -1,10 +1,10 @@
 package lsm
 
 import (
+	"cmp"
+	"math"
 	"slices"
 	"sync/atomic"
-
-	"github.com/cockroachdb/pebble"
 )
 
 // Table is one table's store: its memtables and sstables, in its own
@@ -36,8 +36,10 @@ type immMemTable struct {
 
 // readState is an immutable view of a table's memtables and sstables.
 type readState struct {
-	mems  []*memTable // newest first
-	files []*fileMeta // newest first
+	mems []*memTable // newest first
+	// files are ordered by maximum timestamp, highest first, so a read can
+	// stop once a row deletion shadows everything that remains.
+	files []*fileMeta
 }
 
 // ID returns the table's ID.
@@ -50,6 +52,7 @@ func (t *Table) publishLocked() {
 		mems:  make([]*memTable, 0, len(t.imm)+1),
 		files: slices.Clone(t.files),
 	}
+	slices.SortStableFunc(s.files, func(a, b *fileMeta) int { return cmp.Compare(b.maxTS, a.maxTS) })
 	s.mems = append(s.mems, t.mem)
 	for i := len(t.imm) - 1; i >= 0; i-- {
 		s.mems = append(s.mems, t.imm[i].mem)
@@ -66,7 +69,10 @@ func (t *Table) memtableBytesLocked() int64 {
 	return n
 }
 
-// Get returns a copy of the newest value of key, or ErrNotFound.
+// Get returns the row stored under key: the merge of all its fragments in
+// memtables and sstables (Cassandra's single-partition read). It returns
+// ErrNotFound if the key has no fragments. The row may hold only
+// tombstones; interpreting it is up to the caller (see the row package).
 //
 // Get must not run concurrently with DropTable for the same table; the
 // schema layer serializes them.
@@ -74,34 +80,56 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 	if t.dropped.Load() {
 		return nil, ErrUnknownTable
 	}
+	merger := t.e.opts.Merger
 	// Load the state before the sequence number: every sstable in the state
 	// holds only entries at or below the sequence number loaded after it.
 	s := t.state.Load()
 	seq := t.e.visibleSeq.Load()
+	var acc []byte
+	found := false
 	for _, m := range s.mems {
-		if n := m.get(key, seq); n != nil {
-			if n.kind() == pebble.InternalKeyKindDelete {
-				return nil, ErrNotFound
-			}
-			return append([]byte(nil), n.value...), nil
+		var ok bool
+		var err error
+		if acc, ok, err = m.getMerged(merger, key, seq, acc); err != nil {
+			return nil, err
+		}
+		found = found || ok
+	}
+	deletedAt := int64(math.MinInt64)
+	if found {
+		var err error
+		if deletedAt, err = merger.DeletedAt(acc); err != nil {
+			return nil, err
 		}
 	}
 	for _, f := range s.files {
+		// Files are ordered by maximum timestamp: once a row deletion
+		// shadows this file's newest data, it shadows every remaining file.
+		if f.maxTS <= deletedAt {
+			break
+		}
 		if !f.mayContain(key) {
 			continue
 		}
-		kind, value, found, err := f.reader.get(key)
+		v, ok, err := f.reader.get(key)
 		if err != nil {
 			return nil, err
 		}
-		if found {
-			if kind == pebble.InternalKeyKindDelete {
-				return nil, ErrNotFound
-			}
-			return value, nil
+		if !ok {
+			continue
+		}
+		if acc, err = mergeInto(merger, acc, v); err != nil {
+			return nil, err
+		}
+		found = true
+		if deletedAt, err = merger.DeletedAt(acc); err != nil {
+			return nil, err
 		}
 	}
-	return nil, ErrNotFound
+	if !found {
+		return nil, ErrNotFound
+	}
+	return acc, nil
 }
 
 // Flush flushes the table's mutable memtable and waits until all of the

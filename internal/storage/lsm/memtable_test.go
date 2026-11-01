@@ -189,3 +189,48 @@ func TestMemTableConcurrentGet(t *testing.T) {
 	close(done)
 	wg.Wait()
 }
+
+// TestMemTableConcurrentInsert links nodes from many goroutines at once, as
+// concurrent batches do, and checks that the list ends up complete and
+// ordered.
+func TestMemTableConcurrentInsert(t *testing.T) {
+	m := newMemTable(new(atomic.Int64))
+	const writers, perWriter = 8, 5000
+	var allocMu sync.Mutex
+	var wg sync.WaitGroup
+	var seq atomic.Uint64
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				// Allocation is serialized, as Apply does under commitMu.
+				allocMu.Lock()
+				n := m.newNode([]byte(fmt.Sprintf("k%05d", (w*perWriter+i)*7919%(writers*perWriter))),
+					makeTrailer(seq.Add(1), pebble.InternalKeyKindMerge), nil)
+				allocMu.Unlock()
+				m.insert(n)
+			}
+		}(w)
+	}
+	wg.Wait()
+	count := 0
+	var prev *memNode
+	for n := m.first(); n != nil; n = n.next() {
+		if prev != nil {
+			require.Less(t, compareNode(prev, n.key, n.trailer), 0, "out of order")
+		}
+		prev = n
+		count++
+	}
+	require.Equal(t, writers*perWriter, count)
+	for level := 1; level < maxHeight; level++ {
+		var p *memNode
+		for n := m.head.tower[level].Load(); n != nil; n = n.tower[level].Load() {
+			if p != nil {
+				require.Less(t, compareNode(p, n.key, n.trailer), 0, "level %d out of order", level)
+			}
+			p = n
+		}
+	}
+}

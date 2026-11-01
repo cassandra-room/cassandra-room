@@ -5,7 +5,9 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -47,12 +49,39 @@ type Options struct {
 	// tables pinning the oldest segment are flushed. Defaults to 1 GiB.
 	// (Cassandra: commitlog_total_space.)
 	WALTotalSpace int64
+	// WALSyncPeriod is how often the commit log is fsynced in the background,
+	// making earlier NoSync writes durable. Defaults to 10 s. Negative
+	// disables it. (Cassandra: commitlog_sync periodic, with
+	// commitlog_sync_period 10000ms, its default.)
+	WALSyncPeriod time.Duration
 	// BloomBitsPerKey configures the Bloom filter written into every sstable.
 	// Defaults to 10 (about 1% false positives, Cassandra's default).
 	BloomBitsPerKey uint32
 	// BlockSize is the target uncompressed size of sstable data blocks. Zero
 	// uses Pebble's default.
 	BlockSize int
+	// CacheSize is the size of the block cache shared by all tables.
+	// Defaults to 64 MiB.
+	CacheSize int64
+	// Merger reconciles versions of a row. Defaults to Cassandra's rules
+	// (row.Merger).
+	Merger Merger
+}
+
+// Merger reconciles row fragments. The engine stores every write as a
+// fragment and combines fragments of the same key with Merge, in any order:
+// Merge must be commutative and associative, as Cassandra's reconciliation
+// by timestamp is.
+type Merger interface {
+	// Merge combines two fragments of the same row and appends the result to
+	// dst.
+	Merge(dst, a, b []byte) ([]byte, error)
+	// Timestamps returns the smallest and largest write timestamps in a
+	// fragment, including deletions. ok is false if it holds none.
+	Timestamps(v []byte) (minTS, maxTS int64, ok bool, err error)
+	// DeletedAt returns the timestamp at or below which the fragment's row
+	// deletion shadows all data, or math.MinInt64 if it has none.
+	DeletedAt(v []byte) (int64, error)
 }
 
 func (o *Options) ensureDefaults() {
@@ -71,8 +100,17 @@ func (o *Options) ensureDefaults() {
 	if o.WALTotalSpace <= 0 {
 		o.WALTotalSpace = 1 << 30
 	}
+	if o.WALSyncPeriod == 0 {
+		o.WALSyncPeriod = 10 * time.Second
+	}
 	if o.BloomBitsPerKey == 0 {
 		o.BloomBitsPerKey = 10
+	}
+	if o.CacheSize <= 0 {
+		o.CacheSize = 64 << 20
+	}
+	if o.Merger == nil {
+		o.Merger = row.Merger{}
 	}
 }
 
@@ -82,7 +120,10 @@ const tableFormat = sstable.TableFormatPebblev6
 
 // WriteOptions configures a single write.
 type WriteOptions struct {
-	// Sync makes the write durable (the WAL is fsynced) before Apply returns.
+	// Sync makes the write durable (the WAL is fsynced) before Apply returns,
+	// like Cassandra's commitlog_sync batch or group mode. Without it, the
+	// write is durable after the next periodic sync (WALSyncPeriod), like
+	// Cassandra's default periodic mode.
 	Sync bool
 }
 

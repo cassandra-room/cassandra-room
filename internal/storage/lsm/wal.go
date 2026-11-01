@@ -3,17 +3,21 @@ package lsm
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-// walWriter appends batches to one WAL segment, framed by pebble/record.
+// walWriter appends batches to one WAL segment. It uses Pebble's
+// record.LogWriter, which buffers records and writes them from a background
+// goroutine, so a write costs a memory copy, and concurrent synced writes
+// share one fsync (group commit).
 type walWriter struct {
-	num  uint64
-	f    vfs.File
-	w    *record.Writer
-	size int64 // bytes written so far, approximately
+	num uint64
+	w   *record.LogWriter
+	// syncSem bounds the number of queued syncs, as LogWriter requires.
+	syncSem chan struct{}
 }
 
 func createWAL(fs vfs.FS, dir string, num uint64) (*walWriter, error) {
@@ -21,48 +25,56 @@ func createWAL(fs vfs.FS, dir string, num uint64) (*walWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &walWriter{num: num, f: f, w: record.NewWriter(f)}, nil
+	sem := make(chan struct{}, record.SyncConcurrency-1)
+	w := newLogWriter(f, num, record.LogWriterConfig{
+		QueueSemChan:        sem,
+		WriteWALSyncOffsets: func() bool { return false },
+	})
+	return &walWriter{num: num, w: w, syncSem: sem}, nil
 }
 
-// add appends one batch. The record reaches the OS before add returns; with
-// sync it is also fsynced.
-func (w *walWriter) add(data []byte, sync bool) error {
-	off, err := w.w.WriteRecord(data)
-	if err != nil {
-		return err
-	}
-	w.size = off + int64(len(data))
-	if err := w.w.Flush(); err != nil {
-		return err
-	}
-	if sync {
-		return w.f.Sync()
-	}
-	return nil
+// pendingSync is a queued sync; wait blocks until the record is durable.
+type pendingSync struct {
+	wg  sync.WaitGroup
+	err error
 }
 
-// close syncs and closes the WAL.
-func (w *walWriter) close() error {
-	err := w.w.Close()
-	if serr := w.f.Sync(); err == nil {
-		err = serr
+func (p *pendingSync) wait() error {
+	p.wg.Wait()
+	return p.err
+}
+
+// add queues one batch. With ps == nil it returns once the record is in the
+// writer's buffer; otherwise the record is also queued for sync and ps.wait
+// blocks until it is durable, so the caller can release its locks first.
+func (w *walWriter) add(data []byte, ps *pendingSync) error {
+	if ps == nil {
+		_, err := w.w.WriteRecord(data)
+		return err
 	}
-	if cerr := w.f.Close(); err == nil {
-		err = cerr
-	}
+	w.syncSem <- struct{}{} // released by the LogWriter when the sync completes
+	ps.err = nil
+	ps.wg.Add(1)
+	_, err := w.w.SyncRecord(data, &ps.wg, &ps.err)
 	return err
 }
 
-// replayWAL calls fn for every complete record in the WAL. A torn or zeroed
-// tail (from a crash during a write that was never acknowledged as synced)
-// ends the replay without error.
-func replayWAL(fs vfs.FS, path string, fn func(data []byte) error) error {
+// size returns the bytes written to the segment so far.
+func (w *walWriter) size() int64 { return w.w.Size() }
+
+// close flushes, syncs and closes the segment.
+func (w *walWriter) close() error { return w.w.Close() }
+
+// replayWAL calls fn for every complete record in WAL segment num. A torn or
+// zeroed tail (from a crash during a write that was never acknowledged as
+// synced) ends the replay without error.
+func replayWAL(fs vfs.FS, path string, num uint64, fn func(data []byte) error) error {
 	f, err := fs.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	r := record.NewReader(f, 0)
+	r := newLogReader(f, num)
 	for {
 		rr, err := r.Next()
 		if err == io.EOF || record.IsInvalidRecord(err) {

@@ -7,7 +7,9 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -25,6 +27,9 @@ type Engine struct {
 	lock       io.Closer
 	writerOpts sstable.WriterOptions
 	readerOpts sstable.ReaderOptions
+	merger     Merger
+	// unrefCache releases the engine's reference to the block cache.
+	unrefCache func()
 
 	// commitMu serializes writes: WAL appends and memtable inserts happen in
 	// sequence-number order, and every memtable has a single writer.
@@ -40,6 +45,16 @@ type Engine struct {
 	// manifestMu serializes manifest writes, which happen without mu held.
 	manifestMu sync.Mutex
 
+	// Read by Apply without mu, so the common write path takes only commitMu.
+	// tables is a snapshot of mu.tables, republished when it changes.
+	tables atomic.Pointer[map[TableID]*Table]
+	// immBytes is the memory used by memtables waiting to be flushed.
+	immBytes atomic.Int64
+	// closedWALBytes is the size of live WAL segments other than the current.
+	closedWALBytes atomic.Int64
+	// unusable is set once the engine is closed or has a background error.
+	unusable atomic.Bool
+
 	mu struct {
 		sync.Mutex
 		cond   sync.Cond
@@ -52,13 +67,14 @@ type Engine struct {
 		nextFileNum uint64
 		// flushQueue holds rotated memtables in rotation order.
 		flushQueue []flushJob
-		// immBytes is the memory used by memtables in flushQueue.
-		immBytes int64
-		flushing bool
-		bgErr    error
-		closed   bool
+		flushing   bool
+		bgErr      error
+		closed     bool
 	}
 	flushWG sync.WaitGroup
+
+	// The periodic WAL syncer (WALSyncPeriod).
+	syncStop, syncDone chan struct{}
 }
 
 type walSegment struct {
@@ -85,27 +101,43 @@ func Open(dir string, opts *Options) (*Engine, error) {
 		tablesDir:  o.FS.PathJoin(dir, tablesDirName),
 		writerOpts: makeWriterOptions(&o),
 		readerOpts: makeReaderOptions(),
+		merger:     o.Merger,
 	}
+	// One block cache and handle per engine; blocks are keyed by file number.
+	c := pebble.NewCache(o.CacheSize)
+	e.readerOpts.CacheOpts.CacheHandle = c.NewHandle()
+	e.unrefCache = c.Unref
 	e.mu.cond.L = &e.mu.Mutex
 	e.mu.tables = map[TableID]*Table{}
-	if err := e.fs.MkdirAll(e.tablesDir, 0755); err != nil {
+	fail := func(err error) (*Engine, error) {
+		e.closeFiles()
+		if e.lock != nil {
+			e.lock.Close()
+		}
+		e.releaseCache()
 		return nil, err
+	}
+	if err := e.fs.MkdirAll(e.tablesDir, 0755); err != nil {
+		return fail(err)
 	}
 	// Make the directories durable: each one's entry lives in its parent.
 	for _, d := range []string{e.fs.PathDir(dir), dir} {
 		if err := syncDir(e.fs, d); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	lock, err := e.fs.Lock(e.fs.PathJoin(dir, "LOCK"))
 	if err != nil {
-		return nil, fmt.Errorf("lsm: locking %s: %w", dir, err)
+		return fail(fmt.Errorf("lsm: locking %s: %w", dir, err))
 	}
 	e.lock = lock
 	if err := e.recover(); err != nil {
-		e.closeFiles()
-		lock.Close()
-		return nil, err
+		return fail(err)
+	}
+	if o.WALSyncPeriod > 0 {
+		e.syncStop = make(chan struct{})
+		e.syncDone = make(chan struct{})
+		go e.periodicSync(o.WALSyncPeriod)
 	}
 	return e, nil
 }
@@ -178,7 +210,10 @@ func (e *Engine) recover() error {
 	recovered := map[TableID]*memTable{}
 	var scratch atomic.Int64
 	for _, num := range wals {
-		err := replayWAL(e.fs, e.fs.PathJoin(e.dir, walFileName(num)), func(data []byte) error {
+		err := replayWAL(e.fs, e.fs.PathJoin(e.dir, walFileName(num)), num, func(data []byte) error {
+			if len(data) == 0 {
+				return nil // a periodic sync marker
+			}
 			br, err := newBatchReader(data)
 			if err != nil {
 				return err
@@ -214,7 +249,7 @@ func (e *Engine) recover() error {
 	// lastSeq, so the old WAL segments are no longer needed.
 	for id, m := range recovered {
 		t := e.mu.tables[id]
-		meta, err := writeTable(e.fs, t.dir, nextFileNum, e.writerOpts, m)
+		meta, err := writeTable(e.fs, t.dir, nextFileNum, e.writerOpts, e.merger, m)
 		if err != nil {
 			return err
 		}
@@ -259,6 +294,7 @@ func (e *Engine) recover() error {
 	for _, t := range e.mu.tables {
 		t.publishLocked()
 	}
+	e.publishTablesLocked()
 
 	// Remove what the new manifest no longer references: old WAL segments and
 	// manifests, directories of dropped tables, and sstables from flushes that
@@ -319,6 +355,23 @@ func sortFilesNewestFirst(files []*fileMeta) {
 	})
 }
 
+// publishTablesLocked publishes a snapshot of mu.tables for Apply.
+func (e *Engine) publishTablesLocked() {
+	m := make(map[TableID]*Table, len(e.mu.tables))
+	for id, t := range e.mu.tables {
+		m[id] = t
+	}
+	e.tables.Store(&m)
+}
+
+func (e *Engine) setBackgroundErrorLocked(err error) {
+	if e.mu.bgErr == nil {
+		e.mu.bgErr = err
+	}
+	e.unusable.Store(true)
+	e.mu.cond.Broadcast()
+}
+
 func (e *Engine) checkUsableLocked() error {
 	if e.mu.closed {
 		return ErrClosed
@@ -364,6 +417,7 @@ func (e *Engine) CreateTable(id TableID) (*Table, error) {
 	defer e.mu.Unlock()
 	t.publishLocked()
 	e.mu.tables[id] = t
+	e.publishTablesLocked()
 	return t, nil
 }
 
@@ -409,13 +463,14 @@ func (e *Engine) DropTable(id TableID) error {
 	e.mu.Lock()
 	t.dropped.Store(true)
 	delete(e.mu.tables, id)
+	e.publishTablesLocked()
 	// Discard the table's memtables. No flush is running: flushes hold
 	// manifestMu, which DropTable holds.
 	e.memUsed.Add(-t.mem.approximateSize())
 	queue := e.mu.flushQueue[:0]
 	for _, job := range e.mu.flushQueue {
 		if job.t == t {
-			e.mu.immBytes -= job.imm.mem.approximateSize()
+			e.immBytes.Add(-job.imm.mem.approximateSize())
 			e.memUsed.Add(-job.imm.mem.approximateSize())
 			continue
 		}
@@ -437,52 +492,73 @@ func (e *Engine) DropTable(id TableID) error {
 
 func (e *Engine) setBackgroundError(err error) {
 	e.mu.Lock()
-	if e.mu.bgErr == nil {
-		e.mu.bgErr = err
-	}
-	e.mu.cond.Broadcast()
+	e.setBackgroundErrorLocked(err)
 	e.mu.Unlock()
 }
 
 // Apply writes the batch atomically. Every table it writes to must exist.
+//
+// Writes are serialized by commitMu: a batch gets its sequence numbers, is
+// appended to the WAL (a buffer copy; the WAL is written in the background),
+// and is inserted into the memtables. Readers see it once the visible
+// sequence number covers it, so a batch appears atomically. With Sync, Apply
+// then waits until the WAL is durable, outside commitMu, so concurrent synced
+// writes share one fsync; the batch may be visible before that, as in
+// Cassandra.
+//
+// (Linking memtable entries outside commitMu and publishing batches in order,
+// as Pebble's commit pipeline does, was measured slower here: see the design
+// doc.)
 func (e *Engine) Apply(b *Batch, wo *WriteOptions) error {
 	if b.count == 0 {
 		return nil
 	}
 	sync := wo != nil && wo.Sync
 	e.commitMu.Lock()
-	defer e.commitMu.Unlock()
 
-	e.mu.Lock()
-	if err := e.makeRoomLocked(); err != nil {
+	// Fast path: no limit is crossed, so mu is not needed. The WAL and the
+	// tables' mutable memtables only change while commitMu is held.
+	if !e.roomAvailable() {
+		e.mu.Lock()
+		err := e.makeRoomLocked()
 		e.mu.Unlock()
-		return err
+		if err != nil {
+			e.commitMu.Unlock()
+			return err
+		}
 	}
+	wal := e.mu.wal
 	type target struct {
 		id  TableID
 		mem *memTable
 	}
-	targets := make([]target, 0, len(b.tables))
+	var buf [4]target
+	targets := buf[:0]
+	tables := *e.tables.Load()
 	for _, id := range b.tables {
-		t, ok := e.mu.tables[id]
+		t, ok := tables[id]
 		if !ok {
-			e.mu.Unlock()
+			e.commitMu.Unlock()
 			return fmt.Errorf("%w: %d", ErrUnknownTable, id)
-		}
-		if t.mem.firstSeg == 0 {
-			t.mem.firstSeg = e.mu.wal.num
 		}
 		targets = append(targets, target{id, t.mem})
 	}
-	wal := e.mu.wal
-	e.mu.Unlock()
 
 	seq := e.lastSeq + 1
 	b.setSeqNum(seq)
-	if err := wal.add(b.data, sync); err != nil {
+	var ps *pendingSync
+	if sync {
+		ps = &b.ps
+	}
+	err := wal.add(b.data, ps)
+	if err != nil {
+		e.commitMu.Unlock()
 		// The WAL is in an unknown state; refuse further writes.
 		e.setBackgroundError(fmt.Errorf("lsm: WAL write failed: %w", err))
 		return err
+	}
+	for _, tg := range targets {
+		tg.mem.firstSeg.CompareAndSwap(0, wal.num)
 	}
 	br, _ := newBatchReader(b.data)
 	for s := seq; ; s++ {
@@ -499,7 +575,78 @@ func (e *Engine) Apply(b *Batch, wo *WriteOptions) error {
 	}
 	e.lastSeq = seq + uint64(b.count) - 1
 	e.visibleSeq.Store(e.lastSeq)
+	e.commitMu.Unlock()
+
+	if ps != nil {
+		if err := ps.wait(); err != nil {
+			e.setBackgroundError(fmt.Errorf("lsm: WAL sync failed: %w", err))
+			return err
+		}
+	}
 	return nil
+}
+
+// SyncWAL makes every write so far durable. The periodic syncer calls it
+// every WALSyncPeriod.
+func (e *Engine) SyncWAL() error {
+	b := batchPool.Get().(*Batch)
+	defer batchPool.Put(b)
+	e.commitMu.Lock()
+	if e.unusable.Load() {
+		e.commitMu.Unlock()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.checkUsableLocked()
+	}
+	// An empty record carries the sync; replay skips it.
+	err := e.mu.wal.add(nil, &b.ps)
+	e.commitMu.Unlock()
+	if err == nil {
+		err = b.ps.wait()
+	}
+	if err != nil {
+		e.setBackgroundError(fmt.Errorf("lsm: WAL sync failed: %w", err))
+	}
+	return err
+}
+
+func (e *Engine) periodicSync(period time.Duration) {
+	defer close(e.syncDone)
+	t := time.NewTicker(period)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.syncStop:
+			return
+		case <-t.C:
+			_ = e.SyncWAL()
+		}
+	}
+}
+
+// Put writes one row fragment, using a pooled batch.
+func (e *Engine) Put(table TableID, key, value []byte, wo *WriteOptions) error {
+	b := batchPool.Get().(*Batch)
+	b.Put(table, key, value)
+	err := e.Apply(b, wo)
+	b.Reset()
+	batchPool.Put(b)
+	return err
+}
+
+// roomAvailable reports, without mu, whether a write may proceed without
+// rotating anything or stalling. commitMu is held.
+func (e *Engine) roomAvailable() bool {
+	if e.unusable.Load() {
+		return false
+	}
+	walSize := e.mu.wal.size()
+	if walSize >= e.opts.WALSegmentSize || e.closedWALBytes.Load()+walSize > e.opts.WALTotalSpace {
+		return false
+	}
+	used := e.memUsed.Load()
+	return float64(used-e.immBytes.Load()) <= float64(e.opts.MemTableBudget)*e.opts.MemTableCleanupThreshold &&
+		used <= e.opts.MemTableBudget
 }
 
 // makeRoomLocked enforces the WAL and memory limits before a write, rotating
@@ -510,7 +657,7 @@ func (e *Engine) makeRoomLocked() error {
 		if err := e.checkUsableLocked(); err != nil {
 			return err
 		}
-		if e.mu.wal.size >= e.opts.WALSegmentSize {
+		if e.mu.wal.size() >= e.opts.WALSegmentSize {
 			if err := e.rotateWALLocked(); err != nil {
 				return err
 			}
@@ -520,12 +667,12 @@ func (e *Engine) makeRoomLocked() error {
 			// Rotated memtables are already queued for flush.
 			oldest := e.mu.walSegs[0].num
 			for _, t := range e.mu.tables {
-				if t.mem.firstSeg != 0 && t.mem.firstSeg <= oldest {
+				if fs := t.mem.firstSeg.Load(); fs != 0 && fs <= oldest {
 					e.rotateLocked(t)
 				}
 			}
 		}
-		mutable := e.memUsed.Load() - e.mu.immBytes
+		mutable := e.memUsed.Load() - e.immBytes.Load()
 		if float64(mutable) > float64(e.opts.MemTableBudget)*e.opts.MemTableCleanupThreshold {
 			if t := e.largestMutableLocked(); t != nil {
 				e.rotateLocked(t)
@@ -550,11 +697,7 @@ func (e *Engine) largestMutableLocked() *Table {
 }
 
 func (e *Engine) walBytesLocked() int64 {
-	var n int64
-	for _, s := range e.mu.walSegs[:len(e.mu.walSegs)-1] {
-		n += s.size
-	}
-	return n + e.mu.wal.size
+	return e.closedWALBytes.Load() + e.mu.wal.size()
 }
 
 // rotateWALLocked starts a new WAL segment. commitMu and mu are held.
@@ -569,10 +712,12 @@ func (e *Engine) rotateWALLocked() error {
 		err = e.mu.wal.close()
 	}
 	if err != nil {
-		e.mu.bgErr = fmt.Errorf("lsm: rotating WAL: %w", err)
+		e.setBackgroundErrorLocked(fmt.Errorf("lsm: rotating WAL: %w", err))
 		return e.mu.bgErr
 	}
-	e.mu.walSegs[len(e.mu.walSegs)-1].size = e.mu.wal.size
+	closed := e.mu.wal.size()
+	e.mu.walSegs[len(e.mu.walSegs)-1].size = closed
+	e.closedWALBytes.Add(closed)
 	e.mu.walSegs = append(e.mu.walSegs, walSegment{num: num})
 	e.mu.wal = wal
 	return nil
@@ -588,7 +733,7 @@ func (e *Engine) rotateLocked(t *Table) {
 	im := &immMemTable{mem: t.mem, boundary: e.lastSeq}
 	t.imm = append(t.imm, im)
 	t.mem = newMemTable(&e.memUsed)
-	e.mu.immBytes += im.mem.approximateSize()
+	e.immBytes.Add(im.mem.approximateSize())
 	e.mu.flushQueue = append(e.mu.flushQueue, flushJob{t: t, imm: im})
 	t.publishLocked()
 	e.maybeScheduleFlushLocked()
@@ -608,12 +753,12 @@ func (e *Engine) maybeScheduleFlushLocked() {
 func (e *Engine) minNeededWALLocked(except *immMemTable) uint64 {
 	minSeg := e.mu.wal.num
 	for _, t := range e.mu.tables {
-		if t.mem.firstSeg != 0 {
-			minSeg = min(minSeg, t.mem.firstSeg)
+		if fs := t.mem.firstSeg.Load(); fs != 0 {
+			minSeg = min(minSeg, fs)
 		}
 		for _, im := range t.imm {
 			if im != except {
-				minSeg = min(minSeg, im.mem.firstSeg)
+				minSeg = min(minSeg, im.mem.firstSeg.Load())
 			}
 		}
 	}
@@ -657,7 +802,7 @@ func (e *Engine) flushOne() error {
 	e.mu.nextFileNum++
 	e.mu.Unlock()
 
-	meta, err := writeTable(e.fs, t.dir, num, e.writerOpts, im.mem)
+	meta, err := writeTable(e.fs, t.dir, num, e.writerOpts, e.merger, im.mem)
 	if err == nil && meta != nil {
 		meta.reader, err = openTable(e.fs, t.dir, num, e.readerOpts)
 	}
@@ -719,7 +864,7 @@ func (e *Engine) flushOne() error {
 func (e *Engine) finishFlushLocked(job flushJob) {
 	e.mu.flushQueue = e.mu.flushQueue[1:]
 	sz := job.imm.mem.approximateSize()
-	e.mu.immBytes -= sz
+	e.immBytes.Add(-sz)
 	e.memUsed.Add(-sz)
 	e.mu.cond.Broadcast()
 }
@@ -729,6 +874,7 @@ func (e *Engine) finishFlushLocked(job flushJob) {
 func (e *Engine) deleteObsoleteWALLocked(minWAL uint64) {
 	for len(e.mu.walSegs) > 1 && e.mu.walSegs[0].num < minWAL {
 		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))
+		e.closedWALBytes.Add(-e.mu.walSegs[0].size)
 		e.mu.walSegs = e.mu.walSegs[1:]
 	}
 }
@@ -758,6 +904,14 @@ func (e *Engine) Flush() error {
 // Close waits for an in-progress flush, then closes the engine. Data in
 // memtables is recovered from the WAL on the next Open.
 func (e *Engine) Close() error {
+	if e.syncStop != nil {
+		select {
+		case <-e.syncStop:
+		default:
+			close(e.syncStop)
+			<-e.syncDone
+		}
+	}
 	e.commitMu.Lock()
 	defer e.commitMu.Unlock()
 	e.manifestMu.Lock()
@@ -768,6 +922,7 @@ func (e *Engine) Close() error {
 		return ErrClosed
 	}
 	e.mu.closed = true
+	e.unusable.Store(true)
 	e.mu.cond.Broadcast()
 	e.mu.Unlock()
 	// A flush in progress needs manifestMu to finish; release it meanwhile.
@@ -781,7 +936,19 @@ func (e *Engine) Close() error {
 	if lerr := e.lock.Close(); err == nil {
 		err = lerr
 	}
+	e.releaseCache()
 	return err
+}
+
+func (e *Engine) releaseCache() {
+	if h := e.readerOpts.CacheOpts.CacheHandle; h != nil {
+		h.Close()
+		e.readerOpts.CacheOpts.CacheHandle = nil
+	}
+	if e.unrefCache != nil {
+		e.unrefCache()
+		e.unrefCache = nil
+	}
 }
 
 func (e *Engine) closeFiles() error {
