@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/record"
@@ -48,8 +49,32 @@ type fileMeta struct {
 	// whose data is all older than a row deletion already found.
 	minTS, maxTS int64
 
-	// reader is set while the table is open; it is not part of the manifest.
+	// Runtime state, not part of the manifest.
 	reader *tableReader
+	path   string
+	fs     vfs.FS
+	// refs counts the read states and compactions using the file.
+	refs atomic.Int32
+	// obsolete is set when a compaction replaced the file; it is deleted
+	// once unreferenced.
+	obsolete atomic.Bool
+	// compacting is set while a compaction uses the file. Guarded by
+	// Engine.mu.
+	compacting bool
+}
+
+// unref drops a reference. The last one closes the file, and deletes it if
+// a compaction replaced it.
+func (f *fileMeta) unref() {
+	if f.refs.Add(-1) != 0 {
+		return
+	}
+	if f.reader != nil {
+		_ = f.reader.close()
+	}
+	if f.obsolete.Load() {
+		_ = f.fs.Remove(f.path)
+	}
 }
 
 // tableEdit is the part of a version edit that concerns one table. Fields

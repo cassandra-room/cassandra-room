@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
 	"github.com/cockroachdb/pebble"
@@ -171,6 +172,147 @@ func BenchmarkGetFromSSTables(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+		})
+	}
+}
+
+// BenchmarkScan100 seeks to a random key and reads the next 100 rows.
+func BenchmarkScan100(b *testing.B) {
+	const n = 100000
+	val := benchValue()
+	for _, eng := range engines {
+		b.Run(eng, func(b *testing.B) {
+			s := openBench(b, eng)
+			defer s.close()
+			for i := 0; i < n; i++ {
+				if err := s.put(benchKey(i), val, false); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := s.flush(); err != nil {
+				b.Fatal(err)
+			}
+			if err := s.compact(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := benchKey((i * 7919) % (n - 100))
+				switch st := s.(type) {
+				case lsmStore:
+					it, err := st.tbl.NewIter(nil, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					c := 0
+					for ok := it.SeekGE(start); ok && c < 100; ok = it.Next() {
+						c++
+					}
+					it.Close()
+				case pebbleStore:
+					it, err := st.db.NewIter(nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					c := 0
+					for ok := it.SeekGE(start); ok && c < 100; ok = it.Next() {
+						_ = it.Value()
+						c++
+					}
+					it.Close()
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkWriteSustained overwrites random keys of a 200k-key space with
+// compactions running (the engine: UCS T4; Pebble: leveled), waits for
+// compactions to finish, and reports write amplification as
+// (flushed + compacted) / flushed bytes. Run with a fixed count, for
+// example -benchtime=1000000x.
+func BenchmarkWriteSustained(b *testing.B) {
+	val := benchValue()
+	for _, eng := range engines {
+		b.Run(eng, func(b *testing.B) {
+			var put func(k []byte) error
+			var wait func()
+			var wa func() float64
+			var closeFn func() error
+			switch eng {
+			case "lsm":
+				e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 12 << 20})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := e.CreateTable(1); err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return e.Put(1, k, val, NoSync) }
+				wait = func() {
+					if err := e.Flush(); err != nil {
+						b.Fatal(err)
+					}
+					if err := e.WaitForCompactions(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				wa = func() float64 { return e.Metrics().WriteAmplification }
+				closeFn = e.Close
+			default:
+				c := pebble.NewCache(64 << 20)
+				defer c.Unref()
+				opts := &pebble.Options{FS: vfs.NewMem(), Cache: c, MemTableSize: 4 << 20}
+				for i := range opts.Levels {
+					opts.Levels[i].TableFilterPolicy = func() pebble.TableFilterPolicy { return bloom.FilterPolicy(10) }
+				}
+				db, err := pebble.Open("db", opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				put = func(k []byte) error { return db.Set(k, val, pebble.NoSync) }
+				wait = func() {
+					if err := db.Flush(); err != nil {
+						b.Fatal(err)
+					}
+					// Wait until Pebble has no compaction running or owed, so
+					// both engines are measured after the same work.
+					for {
+						m := db.Metrics()
+						if m.Compact.NumInProgress == 0 && m.Compact.EstimatedDebt == 0 {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				wa = func() float64 {
+					// Sum the levels directly: Metrics.Total adds WAL bytes to
+					// the flushed bytes, which the engine's metric does not.
+					var flushed, compacted float64
+					m := db.Metrics()
+					for i := range m.Levels {
+						l := &m.Levels[i]
+						flushed += float64(l.TablesFlushed.Bytes + l.BlobBytesFlushed)
+						compacted += float64(l.TablesCompacted.Bytes + l.BlobBytesCompacted)
+					}
+					if flushed == 0 {
+						return 0
+					}
+					return (flushed + compacted) / flushed
+				}
+				closeFn = db.Close
+			}
+			defer closeFn()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := put(benchKey((i * 7919) % 200000)); err != nil {
+					b.Fatal(err)
+				}
+			}
+			wait()
+			b.StopTimer()
+			b.ReportMetric(wa(), "write-amp")
 		})
 	}
 }

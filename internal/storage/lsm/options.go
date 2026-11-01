@@ -5,6 +5,7 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/cassandra-room/cassandra-room/internal/storage/row"
@@ -66,6 +67,16 @@ type Options struct {
 	// Merger reconciles versions of a row. Defaults to Cassandra's rules
 	// (row.Merger).
 	Merger Merger
+	// TableOptions returns a table's compaction options; the schema layer
+	// supplies them. Nil gives every table the defaults (UCS T4).
+	TableOptions func(TableID) TableOptions
+	// MaxConcurrentCompactions limits compactions running at once, across
+	// tables. Defaults to min(max(NumCPU/2, 2), 8). (Cassandra:
+	// concurrent_compactors.)
+	MaxConcurrentCompactions int
+	// DisableCompactions turns automatic compactions off (for tests and
+	// benchmarks).
+	DisableCompactions bool
 }
 
 // Merger reconciles row fragments. The engine stores every write as a
@@ -111,6 +122,9 @@ func (o *Options) ensureDefaults() {
 	}
 	if o.Merger == nil {
 		o.Merger = row.Merger{}
+	}
+	if o.MaxConcurrentCompactions <= 0 {
+		o.MaxConcurrentCompactions = min(max(runtime.NumCPU()/2, 2), 8)
 	}
 }
 

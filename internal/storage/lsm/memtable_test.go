@@ -124,7 +124,9 @@ func TestVersionEditRoundTrip(t *testing.T) {
 	require.Equal(t, *e.tables[0], *got.tables[0])
 	require.Equal(t, e.tables[1].deleted, got.tables[1].deleted)
 	require.Equal(t, e.tables[1].flushedSeq, got.tables[1].flushedSeq)
-	require.Equal(t, *e.tables[1].added[0], *got.tables[1].added[0])
+	want, have := e.tables[1].added[0], got.tables[1].added[0]
+	require.Equal(t, []any{want.num, want.size, want.minSeq, want.maxSeq, want.minTS, want.maxTS, want.smallest, want.largest},
+		[]any{have.num, have.size, have.minSeq, have.maxSeq, have.minTS, have.maxTS, have.smallest, have.largest})
 	require.Equal(t, *e.tables[2], *got.tables[2])
 
 	_, err = decodeVersionEdit([]byte{tagAddFile, 1})

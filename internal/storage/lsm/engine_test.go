@@ -163,7 +163,7 @@ func TestFlushReopen(t *testing.T) {
 		}
 	}
 	check(e)
-	require.Greater(t, tableFiles(e, 1), 1, "expected flushes driven by the memory budget")
+	require.Greater(t, e.Metrics().Flushes, int64(1), "expected flushes driven by the memory budget")
 	require.NoError(t, e.Flush())
 	check(e)
 	require.NoError(t, e.Close())
@@ -232,7 +232,7 @@ func TestTableFlushIsPerTable(t *testing.T) {
 // TestMemoryBudgetFlushesLargest checks that exceeding the cleanup threshold
 // flushes the largest memtable, not every table.
 func TestMemoryBudgetFlushesLargest(t *testing.T) {
-	e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 300 << 10, MemTableCleanupThreshold: 0.5})
+	e, err := Open("db", &Options{FS: vfs.NewMem(), MemTableBudget: 300 << 10, MemTableCleanupThreshold: 0.5, DisableCompactions: true})
 	require.NoError(t, err)
 	defer e.Close()
 	_, _ = e.CreateTable(1)

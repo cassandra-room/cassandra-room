@@ -138,3 +138,17 @@ func TestCorrupt(t *testing.T) {
 	_, err = Decode([]byte{version, 0, 1, 1})
 	require.ErrorIs(t, err, ErrCorrupt)
 }
+
+// TestCanonical checks that a fragment's own row deletion shadows its older
+// cells, in its encoding and in Live, so a single fragment and its merge
+// with itself are identical.
+func TestCanonical(t *testing.T) {
+	r := Row{Deletion: Deletion{MarkedForDeleteAt: 10, LocalDeletionTime: 1},
+		Cells: []Cell{live(1, 5, "old"), live(2, 20, "new")}}
+	enc := Append(nil, &r)
+	d, err := Decode(enc)
+	require.NoError(t, err)
+	require.Equal(t, []Cell{live(2, 20, "new")}, d.Cells)
+	require.True(t, bytes.Equal(enc, mustMerge(t, enc, enc)))
+	require.Equal(t, []Cell{live(2, 20, "new")}, r.Live(0))
+}

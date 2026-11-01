@@ -83,11 +83,12 @@ type Row struct {
 	Cells    []Cell // sorted by Column, unique
 }
 
-// Live returns the cells visible at nowInSec.
+// Live returns the cells visible at nowInSec: live, and not shadowed by the
+// row deletion.
 func (r *Row) Live(nowInSec int64) []Cell {
 	var out []Cell
 	for i := range r.Cells {
-		if r.Cells[i].IsLive(nowInSec) {
+		if r.Cells[i].IsLive(nowInSec) && !r.Deletion.Deletes(r.Cells[i].Timestamp) {
 			out = append(out, r.Cells[i])
 		}
 	}
@@ -95,6 +96,8 @@ func (r *Row) Live(nowInSec int64) []Cell {
 }
 
 // Append encodes r and appends it to dst. Cells must be sorted by column.
+// Cells shadowed by the row deletion are dropped, so every row has one
+// encoding and Merge(a, a) == a.
 func Append(dst []byte, r *Row) []byte {
 	flags := byte(0)
 	if !r.Deletion.IsLive() {
@@ -105,9 +108,17 @@ func Append(dst []byte, r *Row) []byte {
 		dst = binary.AppendVarint(dst, r.Deletion.MarkedForDeleteAt)
 		dst = binary.AppendVarint(dst, r.Deletion.LocalDeletionTime)
 	}
-	dst = binary.AppendUvarint(dst, uint64(len(r.Cells)))
+	n := 0
 	for i := range r.Cells {
-		dst = appendCell(dst, &r.Cells[i])
+		if !r.Deletion.Deletes(r.Cells[i].Timestamp) {
+			n++
+		}
+	}
+	dst = binary.AppendUvarint(dst, uint64(n))
+	for i := range r.Cells {
+		if !r.Deletion.Deletes(r.Cells[i].Timestamp) {
+			dst = appendCell(dst, &r.Cells[i])
+		}
 	}
 	return dst
 }

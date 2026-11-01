@@ -66,12 +66,18 @@ type Engine struct {
 		manifest    *manifestWriter
 		nextFileNum uint64
 		// flushQueue holds rotated memtables in rotation order.
-		flushQueue []flushJob
-		flushing   bool
-		bgErr      error
-		closed     bool
+		flushQueue  []flushJob
+		flushing    bool
+		compactions int // running
+		bgErr       error
+		closed      bool
 	}
-	flushWG sync.WaitGroup
+	flushWG   sync.WaitGroup
+	compactWG sync.WaitGroup
+	metrics   struct {
+		bytesFlushed, bytesCompacted atomic.Int64
+		flushes, compactions         atomic.Int64
+	}
 
 	// The periodic WAL syncer (WALSyncPeriod).
 	syncStop, syncDone chan struct{}
@@ -134,6 +140,9 @@ func Open(dir string, opts *Options) (*Engine, error) {
 	if err := e.recover(); err != nil {
 		return fail(err)
 	}
+	e.mu.Lock()
+	e.maybeScheduleCompactionsLocked()
+	e.mu.Unlock()
 	if o.WALSyncPeriod > 0 {
 		e.syncStop = make(chan struct{})
 		e.syncDone = make(chan struct{})
@@ -145,6 +154,10 @@ func Open(dir string, opts *Options) (*Engine, error) {
 func (e *Engine) newTable(id TableID) *Table {
 	t := &Table{e: e, id: id, dir: e.fs.PathJoin(e.tablesDir, id.dirName())}
 	t.mem = newMemTable(&e.memUsed)
+	if e.opts.TableOptions != nil {
+		t.opts = e.opts.TableOptions(id)
+	}
+	t.opts.ensureDefaults()
 	return t
 }
 
@@ -163,11 +176,9 @@ func (e *Engine) recover() error {
 		t := e.newTable(id)
 		t.flushedSeq = tm.flushedSeq
 		for _, f := range tm.files {
-			r, err := openTable(e.fs, t.dir, f.num, e.readerOpts)
-			if err != nil {
+			if err := e.openFile(t, f); err != nil {
 				return fmt.Errorf("lsm: opening table %d file %d: %w", id, f.num, err)
 			}
-			f.reader = r
 			t.files = append(t.files, f)
 			lastSeq = max(lastSeq, f.maxSeq)
 			bump(f.num)
@@ -257,7 +268,7 @@ func (e *Engine) recover() error {
 		if meta == nil {
 			continue
 		}
-		if meta.reader, err = openTable(e.fs, t.dir, meta.num, e.readerOpts); err != nil {
+		if err := e.openFile(t, meta); err != nil {
 			return err
 		}
 		if err := syncDir(e.fs, t.dir); err != nil {
@@ -477,17 +488,14 @@ func (e *Engine) DropTable(id TableID) error {
 		queue = append(queue, job)
 	}
 	e.mu.flushQueue = queue
-	files := t.files
 	t.files, t.imm = nil, nil
+	// Readers still using the table's files keep them open until they
+	// finish; a running compaction notices the drop and discards its output.
+	t.releaseStateLocked()
 	e.mu.cond.Broadcast()
 	e.mu.Unlock()
 
-	var errs []error
-	for _, f := range files {
-		errs = append(errs, f.reader.close())
-	}
-	errs = append(errs, e.fs.RemoveAll(t.dir), syncDir(e.fs, e.tablesDir))
-	return errors.Join(errs...)
+	return errors.Join(e.fs.RemoveAll(t.dir), syncDir(e.fs, e.tablesDir))
 }
 
 func (e *Engine) setBackgroundError(err error) {
@@ -621,6 +629,45 @@ func (e *Engine) periodicSync(period time.Duration) {
 		case <-t.C:
 			_ = e.SyncWAL()
 		}
+	}
+}
+
+// Metrics reports flush and compaction activity.
+type Metrics struct {
+	Flushes, Compactions         int64
+	BytesFlushed, BytesCompacted int64
+	// WriteAmplification is (flushed + compacted) / flushed bytes: how many
+	// times each flushed byte was written to sstables.
+	WriteAmplification float64
+}
+
+// Metrics returns the engine's flush and compaction counters.
+func (e *Engine) Metrics() Metrics {
+	m := Metrics{
+		Flushes:        e.metrics.flushes.Load(),
+		Compactions:    e.metrics.compactions.Load(),
+		BytesFlushed:   e.metrics.bytesFlushed.Load(),
+		BytesCompacted: e.metrics.bytesCompacted.Load(),
+	}
+	if m.BytesFlushed > 0 {
+		m.WriteAmplification = float64(m.BytesFlushed+m.BytesCompacted) / float64(m.BytesFlushed)
+	}
+	return m
+}
+
+// WaitForCompactions waits until no compaction is running or needed.
+func (e *Engine) WaitForCompactions() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for {
+		if err := e.checkUsableLocked(); err != nil {
+			return err
+		}
+		e.maybeScheduleCompactionsLocked()
+		if e.mu.compactions == 0 && len(e.mu.flushQueue) == 0 {
+			return nil
+		}
+		e.mu.cond.Wait()
 	}
 }
 
@@ -804,7 +851,7 @@ func (e *Engine) flushOne() error {
 
 	meta, err := writeTable(e.fs, t.dir, num, e.writerOpts, e.merger, im.mem)
 	if err == nil && meta != nil {
-		meta.reader, err = openTable(e.fs, t.dir, num, e.readerOpts)
+		err = e.openFile(t, meta)
 	}
 	if err == nil {
 		err = syncDir(e.fs, t.dir)
@@ -849,6 +896,9 @@ func (e *Engine) flushOne() error {
 	} else {
 		if meta != nil {
 			t.files = append([]*fileMeta{meta}, t.files...)
+			t.observeFlushLocked(meta.size)
+			e.metrics.bytesFlushed.Add(int64(meta.size))
+			e.metrics.flushes.Add(1)
 		}
 		t.flushedSeq = im.boundary
 		t.imm = t.imm[1:]
@@ -856,6 +906,7 @@ func (e *Engine) flushOne() error {
 	}
 	e.finishFlushLocked(job)
 	e.deleteObsoleteWALLocked(edit.minWAL)
+	e.maybeScheduleCompactionsLocked()
 	return nil
 }
 
@@ -925,9 +976,11 @@ func (e *Engine) Close() error {
 	e.unusable.Store(true)
 	e.mu.cond.Broadcast()
 	e.mu.Unlock()
-	// A flush in progress needs manifestMu to finish; release it meanwhile.
+	// Flushes and compactions in progress need manifestMu to finish; release
+	// it meanwhile. Compactions notice the close and stop early.
 	e.manifestMu.Unlock()
 	e.flushWG.Wait()
+	e.compactWG.Wait()
 	e.manifestMu.Lock()
 
 	e.mu.Lock()
@@ -962,10 +1015,14 @@ func (e *Engine) closeFiles() error {
 		e.mu.manifest = nil
 	}
 	for _, t := range e.mu.tables {
-		for _, f := range t.files {
-			if f.reader != nil {
-				errs = append(errs, f.reader.close())
-				f.reader = nil
+		if t.state.Load() != nil {
+			t.releaseStateLocked()
+		} else {
+			// Open failed before the table's state was published.
+			for _, f := range t.files {
+				if f.reader != nil {
+					errs = append(errs, f.reader.close())
+				}
 			}
 		}
 	}

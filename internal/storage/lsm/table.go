@@ -1,6 +1,7 @@
 package lsm
 
 import (
+	"bytes"
 	"cmp"
 	"math"
 	"slices"
@@ -23,6 +24,10 @@ type Table struct {
 	imm        []*immMemTable // oldest first
 	files      []*fileMeta    // newest first (by maxSeq)
 	flushedSeq uint64
+	opts       TableOptions
+	// flushSize is a moving average of flush output sizes, UCS's m.
+	flushSize  float64
+	compacting bool
 }
 
 // immMemTable is a memtable waiting to be flushed.
@@ -34,12 +39,38 @@ type immMemTable struct {
 	boundary uint64
 }
 
-// readState is an immutable view of a table's memtables and sstables.
+// readState is an immutable view of a table's memtables and sstables. It is
+// reference counted: the table holds one reference while the state is
+// current, and each reader holds one while it reads. The state holds a
+// reference on each of its files, so a file replaced by a compaction is
+// closed and deleted only after its last reader finishes.
 type readState struct {
 	mems []*memTable // newest first
 	// files are ordered by maximum timestamp, highest first, so a read can
 	// stop once a row deletion shadows everything that remains.
 	files []*fileMeta
+	refs  atomic.Int32
+}
+
+// acquireState returns the current state with a reference held.
+func (t *Table) acquireState() *readState {
+	for {
+		s := t.state.Load()
+		if r := s.refs.Load(); r > 0 && s.refs.CompareAndSwap(r, r+1) {
+			return s
+		}
+		// The state was released after we loaded it; a newer one is
+		// already published.
+	}
+}
+
+// release drops a reference; the last one releases the state's files.
+func (s *readState) release() {
+	if s.refs.Add(-1) == 0 {
+		for _, f := range s.files {
+			f.unref()
+		}
+	}
 }
 
 // ID returns the table's ID.
@@ -57,7 +88,24 @@ func (t *Table) publishLocked() {
 	for i := len(t.imm) - 1; i >= 0; i-- {
 		s.mems = append(s.mems, t.imm[i].mem)
 	}
-	t.state.Store(s)
+	for _, f := range s.files {
+		f.refs.Add(1)
+	}
+	s.refs.Store(1)
+	if old := t.state.Swap(s); old != nil {
+		old.release()
+	}
+}
+
+// releaseStateLocked drops the table's reference on its current state, when
+// the table is dropped or the engine closes. Readers that still hold the old
+// state keep its files open until they finish.
+func (t *Table) releaseStateLocked() {
+	empty := &readState{}
+	empty.refs.Store(1)
+	if old := t.state.Swap(empty); old != nil {
+		old.release()
+	}
 }
 
 // memtableBytesLocked returns the memory used by the table's memtables.
@@ -83,7 +131,8 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 	merger := t.e.opts.Merger
 	// Load the state before the sequence number: every sstable in the state
 	// holds only entries at or below the sequence number loaded after it.
-	s := t.state.Load()
+	s := t.acquireState()
+	defer s.release()
 	seq := t.e.visibleSeq.Load()
 	var acc []byte
 	found := false
@@ -103,9 +152,12 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 		}
 	}
 	for _, f := range s.files {
-		// Files are ordered by maximum timestamp: once a row deletion
-		// shadows this file's newest data, it shadows every remaining file.
-		if f.maxTS <= deletedAt {
+		// Files are ordered by maximum timestamp: once a row deletion is
+		// newer than this file's newest data, it shadows every remaining
+		// file. The comparison is strict: a deletion with the same timestamp
+		// in a remaining file could still supersede it (by local deletion
+		// time), and a file without timestamps has maxTS = MinInt64.
+		if found && f.maxTS < deletedAt {
 			break
 		}
 		if !f.mayContain(key) {
@@ -159,4 +211,93 @@ func (t *Table) Flush() error {
 		return ErrUnknownTable
 	}
 	return nil
+}
+
+// Iterator iterates a table's rows in key order within [lower, upper),
+// merging each row's fragments (Cassandra's partition-range and slice
+// reads). Key and Value are valid until the next positioning call. An
+// Iterator is not safe for concurrent use.
+type Iterator struct {
+	s            *readState
+	m            mergingIter
+	lower, upper []byte
+	valid        bool
+}
+
+// NewIter returns an iterator over [lower, upper); nil bounds are open. It
+// reads a consistent view: writes after NewIter returns are not visible.
+func (t *Table) NewIter(lower, upper []byte) (*Iterator, error) {
+	if t.dropped.Load() {
+		return nil, ErrUnknownTable
+	}
+	s := t.acquireState()
+	seq := t.e.visibleSeq.Load()
+	it := &Iterator{s: s, lower: lower, upper: upper}
+	it.m.merger = t.e.opts.Merger
+	it.m.upper = upper
+	for _, m := range s.mems {
+		it.m.sources = append(it.m.sources, &memSource{m: m, merger: it.m.merger, seq: seq})
+	}
+	for _, f := range s.files {
+		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
+			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
+			continue
+		}
+		src, err := newTableSource(f.reader, lower, upper, false)
+		if err != nil {
+			it.Close()
+			return nil, err
+		}
+		it.m.sources = append(it.m.sources, src)
+	}
+	return it, nil
+}
+
+// First moves to the first row at or after the lower bound.
+func (it *Iterator) First() bool {
+	if it.lower != nil {
+		return it.SeekGE(it.lower)
+	}
+	it.valid = it.m.first()
+	return it.valid
+}
+
+// SeekGE moves to the first row at or after key (and the lower bound).
+func (it *Iterator) SeekGE(key []byte) bool {
+	if it.lower != nil && bytes.Compare(key, it.lower) < 0 {
+		key = it.lower
+	}
+	it.valid = it.m.seekGE(key)
+	return it.valid
+}
+
+// Next moves to the next row.
+func (it *Iterator) Next() bool {
+	if !it.valid {
+		return false
+	}
+	it.valid = it.m.next()
+	return it.valid
+}
+
+// Valid reports whether the iterator is at a row.
+func (it *Iterator) Valid() bool { return it.valid }
+
+// Key returns the current row's key.
+func (it *Iterator) Key() []byte { return it.m.key }
+
+// Value returns the current row: the merge of its fragments.
+func (it *Iterator) Value() []byte { return it.m.value }
+
+// Error returns the first error the iterator hit.
+func (it *Iterator) Error() error { return it.m.e }
+
+// Close releases the iterator's sources and its view of the table.
+func (it *Iterator) Close() error {
+	err := it.m.close()
+	if it.s != nil {
+		it.s.release()
+		it.s = nil
+	}
+	return err
 }
