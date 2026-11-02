@@ -23,6 +23,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"slices"
+	"sync"
 )
 
 const (
@@ -207,17 +209,26 @@ func (d *decoder) next(c *Cell) bool {
 
 // Decode decodes a row. Cell values alias b.
 func Decode(b []byte) (*Row, error) {
+	r := &Row{}
+	if err := decodeInto(r, b); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// decodeInto decodes a row into r, reusing r.Cells' storage.
+func decodeInto(r *Row, b []byte) error {
 	d := newDecoder(b)
-	r := &Row{Deletion: d.deletion}
+	r.Deletion, r.Cells = d.deletion, r.Cells[:0]
 	var c Cell
 	for d.next(&c) {
 		r.Cells = append(r.Cells, c)
 	}
-	if d.err != nil {
-		return nil, d.err
-	}
-	return r, nil
+	return d.err
 }
+
+// rowPool holds rows for decoding scratch.
+var rowPool = sync.Pool{New: func() any { return new(Row) }}
 
 // reconcile returns the cell that wins between two cells of the same column
 // (Cassandra's Cells.resolveRegular).
@@ -355,3 +366,263 @@ func (Merger) Timestamps(v []byte) (minTS, maxTS int64, ok bool, err error) {
 
 // DeletedAt implements lsm.Merger.
 func (Merger) DeletedAt(v []byte) (int64, error) { return DeletedAt(v) }
+
+// Stats summarises a row for sstable metadata (Cassandra's
+// MetadataCollector: timestamps, local deletion times, tombstones).
+type Stats struct {
+	// MinTS and MaxTS are the smallest and largest timestamps, counting the
+	// row deletion; HasTS is false for an empty row.
+	MinTS, MaxTS int64
+	HasTS        bool
+	// MaxLDT is the largest local deletion time, NoDeletionTime if the row
+	// has a live (non-expiring) cell: once MaxLDT is in the past, every part
+	// of the row is deleted or expired.
+	MaxLDT int64
+	// Tombstones counts cell tombstones, expiring cells and the row
+	// deletion: the parts that become droppable at their local deletion
+	// time (the expiry time, for expiring cells).
+	Tombstones int
+	// MinLDT is the earliest local deletion time of those parts, or
+	// NoDeletionTime if there are none: nothing in the row can be purged
+	// before MinLDT.
+	MinLDT int64
+	// Cells counts the row's cells, live or not (Cassandra's cell count,
+	// the denominator of the droppable tombstone ratio).
+	Cells int
+}
+
+// Summarize returns the row's Stats. If ldt is not nil, it is called with
+// the local deletion time of every tombstone, expiring cell and row deletion
+// (for the tombstone drop-time histogram).
+func Summarize(v []byte, ldt func(int64)) (Stats, error) {
+	d := newDecoder(v)
+	s := Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	droppable := func(t int64) {
+		s.Tombstones++
+		s.MinLDT = min(s.MinLDT, t)
+		s.MaxLDT = max(s.MaxLDT, t)
+		if ldt != nil {
+			ldt(t)
+		}
+	}
+	if !d.deletion.IsLive() {
+		s.MinTS, s.MaxTS, s.HasTS = d.deletion.MarkedForDeleteAt, d.deletion.MarkedForDeleteAt, true
+		droppable(d.deletion.LocalDeletionTime)
+	}
+	var c Cell
+	for d.next(&c) {
+		s.Cells++
+		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			s.MaxLDT = NoDeletionTime
+		} else {
+			droppable(c.LocalDeletionTime)
+		}
+	}
+	return s, d.err
+}
+
+// Purge drops from row v what Cassandra's compaction purges
+// (AbstractCell.purge, DeletionPurger.shouldPurge): tombstones, expired
+// cells and a row deletion whose local deletion time is before gcBefore and
+// whose timestamp is below maxPurgeable, the smallest timestamp of the row's
+// data outside the compaction. Such a deletion cannot shadow anything still
+// stored elsewhere, so dropping it never changes what reads return.
+// maxPurgeable is called at most once, only if something is a candidate,
+// with the smallest and largest candidate timestamps: it may skip data newer
+// than maxTS (it decides nothing), and may return math.MinInt64 as soon as
+// it finds data at or below minTS (then nothing can be purged).
+//
+// Unlike Cassandra, expired cells that cannot be purged yet are not turned
+// into tombstones: a tombstone beats an expiring cell of the same
+// timestamp, so the conversion could hide a later-expiring cell stored
+// elsewhere.
+//
+// It appends the result to dst; empty reports that purging left nothing (no
+// cells and no row deletion), so the row can be dropped. If nothing is
+// purged, it returns v itself, and changed and empty are false.
+func Purge(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error)) (out []byte, changed, empty bool, err error) {
+	out, changed, empty, _, err = PurgeAndSummarize(dst, v, nowSec, gcBefore, maxPurgeable, nil)
+	return out, changed, empty, err
+}
+
+// PurgeAndSummarize is Purge that also returns the Stats of the result (as
+// Summarize would, reporting its local deletion times to ldt), from the
+// same single decoding of v.
+func PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) (out []byte, changed, empty bool, st Stats, err error) {
+	d := newDecoder(v)
+	candidate := func(ldt int64) bool { return ldt < gcBefore && ldt <= nowSec }
+	cand := false
+	minTS, maxTS := int64(math.MaxInt64), int64(math.MinInt64)
+	note := func(ts int64) { cand, minTS, maxTS = true, min(minTS, ts), max(maxTS, ts) }
+	st = Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	var ldtBuf [8]int64
+	ldts := ldtBuf[:0]
+	droppable := func(t int64) {
+		st.Tombstones++
+		st.MinLDT, st.MaxLDT = min(st.MinLDT, t), max(st.MaxLDT, t)
+		ldts = append(ldts, t)
+	}
+	if !d.deletion.IsLive() {
+		st.MinTS, st.MaxTS, st.HasTS = d.deletion.MarkedForDeleteAt, d.deletion.MarkedForDeleteAt, true
+		droppable(d.deletion.LocalDeletionTime)
+		if candidate(d.deletion.LocalDeletionTime) {
+			note(d.deletion.MarkedForDeleteAt)
+		}
+	}
+	var c Cell
+	for d.next(&c) {
+		st.Cells++
+		st.MinTS, st.MaxTS, st.HasTS = min(st.MinTS, c.Timestamp), max(st.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			st.MaxLDT = NoDeletionTime
+			continue
+		}
+		droppable(c.LocalDeletionTime)
+		if !c.IsLive(nowSec) && candidate(c.LocalDeletionTime) {
+			note(c.Timestamp)
+		}
+	}
+	if d.err != nil {
+		return nil, false, false, Stats{}, d.err
+	}
+	unchanged := func() ([]byte, bool, bool, Stats, error) {
+		if ldt != nil {
+			for _, t := range ldts {
+				ldt(t)
+			}
+		}
+		return v, false, false, st, nil
+	}
+	if !cand {
+		return unchanged()
+	}
+	limit, err := maxPurgeable(minTS, maxTS)
+	if err != nil {
+		return nil, false, false, Stats{}, err
+	}
+	shouldPurge := func(ts, ldt int64) bool { return candidate(ldt) && ts < limit }
+	r := rowPool.Get().(*Row)
+	defer func() {
+		clear(r.Cells) // drop references into v
+		rowPool.Put(r)
+	}()
+	if err := decodeInto(r, v); err != nil {
+		return nil, false, false, Stats{}, err
+	}
+	if !r.Deletion.IsLive() && shouldPurge(r.Deletion.MarkedForDeleteAt, r.Deletion.LocalDeletionTime) {
+		r.Deletion = Deletion{MarkedForDeleteAt: NoTimestamp}
+		changed = true
+	}
+	kept := r.Cells[:0]
+	for _, c := range r.Cells {
+		if c.LocalDeletionTime != NoDeletionTime && !c.IsLive(nowSec) && shouldPurge(c.Timestamp, c.LocalDeletionTime) {
+			changed = true
+			continue
+		}
+		kept = append(kept, c)
+	}
+	r.Cells = kept
+	if !changed {
+		return unchanged()
+	}
+	empty = len(r.Cells) == 0 && r.Deletion.IsLive()
+	if empty {
+		return dst, true, true, Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}, nil
+	}
+	return Append(dst, r), true, false, statsOf(r, ldt), nil
+}
+
+// statsOf is Summarize of a decoded row.
+func statsOf(r *Row, ldt func(int64)) Stats {
+	s := Stats{MinTS: math.MaxInt64, MaxTS: math.MinInt64, MaxLDT: math.MinInt64, MinLDT: NoDeletionTime}
+	droppable := func(t int64) {
+		s.Tombstones++
+		s.MinLDT, s.MaxLDT = min(s.MinLDT, t), max(s.MaxLDT, t)
+		if ldt != nil {
+			ldt(t)
+		}
+	}
+	if !r.Deletion.IsLive() {
+		s.MinTS, s.MaxTS, s.HasTS = r.Deletion.MarkedForDeleteAt, r.Deletion.MarkedForDeleteAt, true
+		droppable(r.Deletion.LocalDeletionTime)
+	}
+	for i := range r.Cells {
+		c := &r.Cells[i]
+		s.Cells++
+		s.MinTS, s.MaxTS, s.HasTS = min(s.MinTS, c.Timestamp), max(s.MaxTS, c.Timestamp), true
+		if c.LocalDeletionTime == NoDeletionTime {
+			s.MaxLDT = NoDeletionTime
+		} else {
+			droppable(c.LocalDeletionTime)
+		}
+	}
+	return s
+}
+
+// Summarize implements lsm.Purger.
+func (Merger) Summarize(v []byte, ldt func(int64)) (Stats, error) { return Summarize(v, ldt) }
+
+// PurgeAndSummarize implements lsm.Purger.
+func (Merger) PurgeAndSummarize(dst, v []byte, nowSec, gcBefore int64, maxPurgeable func(minTS, maxTS int64) (int64, error), ldt func(int64)) ([]byte, bool, bool, Stats, error) {
+	return PurgeAndSummarize(dst, v, nowSec, gcBefore, maxPurgeable, ldt)
+}
+
+// Part is the share of a row that falls in one bucket.
+type Part struct {
+	Bucket int64
+	Value  []byte
+}
+
+// SplitByTimestamp splits row v by the bucket of each part's timestamp
+// (ScyllaDB's segregate_by_timestamp): every cell goes to the bucket of its
+// timestamp, the row deletion to the bucket of its MarkedForDeleteAt. The
+// parts merge back to v (Merge is commutative and v holds no cell its
+// deletion shadows), so writing them to separate sstables changes nothing
+// reads see. A row within one bucket comes back as a single part holding v
+// itself; an empty row as one part in bucket(math.MinInt64).
+func SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
+	lo, hi, ok, err := Timestamps(v)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return []Part{{Bucket: bucket(math.MinInt64), Value: v}}, nil
+	}
+	if bucket(lo) == bucket(hi) {
+		return []Part{{Bucket: bucket(lo), Value: v}}, nil
+	}
+	r, err := Decode(v)
+	if err != nil {
+		return nil, err
+	}
+	rows := map[int64]*Row{}
+	var order []int64
+	get := func(b int64) *Row {
+		p := rows[b]
+		if p == nil {
+			p = &Row{Deletion: Deletion{MarkedForDeleteAt: NoTimestamp}}
+			rows[b] = p
+			order = append(order, b)
+		}
+		return p
+	}
+	if !r.Deletion.IsLive() {
+		get(bucket(r.Deletion.MarkedForDeleteAt)).Deletion = r.Deletion
+	}
+	for _, c := range r.Cells {
+		p := get(bucket(c.Timestamp))
+		p.Cells = append(p.Cells, c)
+	}
+	slices.Sort(order)
+	parts := make([]Part, 0, len(order))
+	for _, b := range order {
+		parts = append(parts, Part{Bucket: b, Value: Append(nil, rows[b])})
+	}
+	return parts, nil
+}
+
+// SplitByTimestamp implements lsm.TimeSplitter.
+func (Merger) SplitByTimestamp(v []byte, bucket func(ts int64) int64) ([]Part, error) {
+	return SplitByTimestamp(v, bucket)
+}

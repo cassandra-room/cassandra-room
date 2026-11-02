@@ -20,10 +20,35 @@ type walWriter struct {
 	syncSem chan struct{}
 }
 
-func createWAL(fs vfs.FS, dir string, num uint64) (*walWriter, error) {
-	f, err := fs.Create(fs.PathJoin(dir, walFileName(num)), vfs.WriteCategoryUnspecified)
+// createWAL creates WAL segment num. If recycle is non-zero, the obsolete
+// segment with that number is renamed and overwritten instead of creating a
+// new file, as Pebble does: overwriting allocated blocks avoids growing the
+// file, and on a real disk makes each fsync cheaper (no block allocation or
+// file size update to journal). Records carry their segment number, so on
+// replay the old segment's records left past the new end are recognised as
+// stale and end the replay; recycle must be lower than num. A new file is
+// preallocated to preallocate bytes.
+func createWAL(fs vfs.FS, dir string, num, recycle uint64, preallocate int64) (*walWriter, error) {
+	path := fs.PathJoin(dir, walFileName(num))
+	var f vfs.File
+	var err error
+	if recycle != 0 {
+		if recycle >= num {
+			return nil, fmt.Errorf("lsm: recycling WAL %d as %d", recycle, num)
+		}
+		f, err = fs.ReuseForWrite(fs.PathJoin(dir, walFileName(recycle)), path, vfs.WriteCategoryUnspecified)
+	} else {
+		f, err = fs.Create(path, vfs.WriteCategoryUnspecified)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if recycle == 0 && preallocate > 0 {
+		// Reserve the segment's space up front, as Cassandra creates commit
+		// log segments at their full size: later syncs then need not
+		// allocate blocks or record a new file size. Best effort: some file
+		// systems do not support it.
+		_ = f.Preallocate(0, preallocate)
 	}
 	sem := make(chan struct{}, record.SyncConcurrency-1)
 	w := newLogWriter(f, num, record.LogWriterConfig{

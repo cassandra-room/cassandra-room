@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"sync/atomic"
+	"time"
 )
 
 // Table is one table's store: its memtables and sstables, in its own
@@ -26,8 +27,18 @@ type Table struct {
 	flushedSeq uint64
 	opts       TableOptions
 	// flushSize is a moving average of flush output sizes, UCS's m.
-	flushSize  float64
-	compacting bool
+	flushSize float64
+	// lastExpiredCheck is when fully expired sstables were last looked for.
+	lastExpiredCheck time.Time
+	// highestWindowSeen is the time-window mode's current window: the
+	// newest seen, never moving back.
+	highestWindowSeen int64
+	windowSeen        bool
+	// recentWindows are past windows not yet compacted into one run since
+	// they were the newest (ScyllaDB's recent_active_windows).
+	recentWindows map[int64]bool
+	// majorPending pauses background compactions while Compact waits.
+	majorPending bool
 }
 
 // immMemTable is a memtable waiting to be flushed.
@@ -37,6 +48,16 @@ type immMemTable struct {
 	// rotated: every entry of the table at or below it is in this memtable or
 	// an older one.
 	boundary uint64
+}
+
+// flushBoundaries returns the shard boundaries a flush of mem is split at:
+// UCS shards flush output like compaction output, by its density (the
+// memtable covers the whole token space).
+func (t *Table) flushBoundaries(mem *memTable) [][]byte {
+	if t.opts.TimeWindow > 0 {
+		return nil
+	}
+	return shardBoundaries(t.opts.numShards(float64(mem.approximateSize())))
 }
 
 // readState is an immutable view of a table's memtables and sstables. It is
@@ -128,12 +149,17 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 	if t.dropped.Load() {
 		return nil, ErrUnknownTable
 	}
-	merger := t.e.opts.Merger
 	// Load the state before the sequence number: every sstable in the state
 	// holds only entries at or below the sequence number loaded after it.
 	s := t.acquireState()
 	defer s.release()
-	seq := t.e.visibleSeq.Load()
+	return t.getFromState(s, t.e.visibleSeq.Load(), key)
+}
+
+// getFromState looks key up in a read state, ignoring memtable entries
+// above seq.
+func (t *Table) getFromState(s *readState, seq uint64, key []byte) ([]byte, error) {
+	merger := t.e.opts.Merger
 	var acc []byte
 	found := false
 	for _, m := range s.mems {
@@ -163,15 +189,13 @@ func (t *Table) Get(key []byte) ([]byte, error) {
 		if !f.mayContain(key) {
 			continue
 		}
-		v, ok, err := f.reader.get(key)
-		if err != nil {
+		var ok bool
+		var err error
+		if acc, ok, err = f.reader.getMerged(merger, key, acc); err != nil {
 			return nil, err
 		}
 		if !ok {
 			continue
-		}
-		if acc, err = mergeInto(merger, acc, v); err != nil {
-			return nil, err
 		}
 		found = true
 		if deletedAt, err = merger.DeletedAt(acc); err != nil {
@@ -222,7 +246,20 @@ type Iterator struct {
 	m            mergingIter
 	lower, upper []byte
 	valid        bool
+
+	// Inline storage, so that an iterator over a few memtables and sstables
+	// needs one allocation (slices grow past it if needed).
+	buf struct {
+		sources [iterInlineSources]source
+		mems    [2]memSource
+		tables  [iterInlineSources]tableSource
+		entries [iterInlineSources]srcEntry
+		heap    [iterInlineSources]*srcEntry
+		cur     [iterInlineSources]*srcEntry
+	}
 }
+
+const iterInlineSources = 4
 
 // NewIter returns an iterator over [lower, upper); nil bounds are open. It
 // reads a consistent view: writes after NewIter returns are not visible.
@@ -231,24 +268,49 @@ func (t *Table) NewIter(lower, upper []byte) (*Iterator, error) {
 		return nil, ErrUnknownTable
 	}
 	s := t.acquireState()
-	seq := t.e.visibleSeq.Load()
+	return t.newIterFromState(s, t.e.visibleSeq.Load(), lower, upper)
+}
+
+// newIterFromState returns an iterator over a read state, ignoring
+// memtable entries above seq. It takes over the caller's reference on s.
+func (t *Table) newIterFromState(s *readState, seq uint64, lower, upper []byte) (*Iterator, error) {
 	it := &Iterator{s: s, lower: lower, upper: upper}
 	it.m.merger = t.e.opts.Merger
 	it.m.upper = upper
+	it.m.sources = it.buf.sources[:0]
+	// Sources point into these slices, so they must not be reallocated
+	// after the first pointer is taken: size them up front.
+	mems := it.buf.mems[:0]
+	if len(s.mems) > len(it.buf.mems) {
+		mems = make([]memSource, 0, len(s.mems))
+	}
 	for _, m := range s.mems {
-		it.m.sources = append(it.m.sources, &memSource{m: m, merger: it.m.merger, seq: seq})
+		if m.empty() {
+			continue
+		}
+		mems = append(mems, memSource{m: m, merger: it.m.merger, seq: seq})
+		it.m.sources = append(it.m.sources, &mems[len(mems)-1])
+	}
+	tables := it.buf.tables[:0]
+	if len(s.files) > len(it.buf.tables) {
+		tables = make([]tableSource, 0, len(s.files))
 	}
 	for _, f := range s.files {
 		if (upper != nil && bytes.Compare(f.smallest.UserKey, upper) >= 0) ||
 			(lower != nil && bytes.Compare(f.largest.UserKey, lower) < 0) {
 			continue
 		}
-		src, err := newTableSource(f.reader, lower, upper, false)
-		if err != nil {
+		tables = append(tables, tableSource{})
+		src := &tables[len(tables)-1]
+		if err := src.init(f.reader, lower, upper, false); err != nil {
 			it.Close()
 			return nil, err
 		}
 		it.m.sources = append(it.m.sources, src)
+	}
+	n := len(it.m.sources)
+	if n <= iterInlineSources {
+		it.m.entries, it.m.h, it.m.cur = it.buf.entries[:n], it.buf.heap[:0], it.buf.cur[:0]
 	}
 	return it, nil
 }

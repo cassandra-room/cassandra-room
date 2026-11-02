@@ -62,7 +62,10 @@ type Engine struct {
 		wal    *walWriter
 		// walSegs are the live WAL segments, oldest first; the last one is
 		// being written.
-		walSegs     []walSegment
+		walSegs []walSegment
+		// recycledWAL holds obsolete WAL segments kept for reuse, oldest
+		// first (at most walRecycleLimit).
+		recycledWAL []uint64
 		manifest    *manifestWriter
 		nextFileNum uint64
 		// flushQueue holds rotated memtables in rotation order.
@@ -74,9 +77,18 @@ type Engine struct {
 	}
 	flushWG   sync.WaitGroup
 	compactWG sync.WaitGroup
-	metrics   struct {
+	// testAfterEarlyRelease, if set, runs after a compaction swaps out inputs
+	// before finishing (with the engine mutexes released).
+	testAfterEarlyRelease func()
+	// compactionSem bounds the compaction tasks (output shards) running at
+	// once, across compactions (Cassandra: concurrent_compactors).
+	compactionSem chan struct{}
+	metrics       struct {
 		bytesFlushed, bytesCompacted atomic.Int64
 		flushes, compactions         atomic.Int64
+		tombstoneCompactions         atomic.Int64
+		earlyReleases                atomic.Int64
+		expiredDropped               atomic.Int64
 	}
 
 	// The periodic WAL syncer (WALSyncPeriod).
@@ -109,6 +121,7 @@ func Open(dir string, opts *Options) (*Engine, error) {
 		readerOpts: makeReaderOptions(),
 		merger:     o.Merger,
 	}
+	e.compactionSem = make(chan struct{}, o.MaxConcurrentCompactions)
 	// One block cache and handle per engine; blocks are keyed by file number.
 	c := pebble.NewCache(o.CacheSize)
 	e.readerOpts.CacheOpts.CacheHandle = c.NewHandle()
@@ -175,6 +188,11 @@ func (e *Engine) recover() error {
 	for id, tm := range state.tables {
 		t := e.newTable(id)
 		t.flushedSeq = tm.flushedSeq
+		// Sequence numbers resume above every table's flushed sequence
+		// number, not only above the data that remains: purging can remove
+		// the newest rows, and a reused sequence number at or below a
+		// table's flushed one would be skipped by a later WAL replay.
+		lastSeq = max(lastSeq, tm.flushedSeq)
 		for _, f := range tm.files {
 			if err := e.openFile(t, f); err != nil {
 				return fmt.Errorf("lsm: opening table %d file %d: %w", id, f.num, err)
@@ -260,26 +278,25 @@ func (e *Engine) recover() error {
 	// lastSeq, so the old WAL segments are no longer needed.
 	for id, m := range recovered {
 		t := e.mu.tables[id]
-		meta, err := writeTable(e.fs, t.dir, nextFileNum, e.writerOpts, e.merger, m)
+		alloc := func() uint64 { nextFileNum++; return nextFileNum - 1 }
+		metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, m, t.flushBoundaries(m), t.opts.fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
 		if err != nil {
 			return err
 		}
-		nextFileNum++
-		if meta == nil {
-			continue
-		}
-		if err := e.openFile(t, meta); err != nil {
-			return err
+		for _, meta := range metas {
+			if err := e.openFile(t, meta); err != nil {
+				return err
+			}
 		}
 		if err := syncDir(e.fs, t.dir); err != nil {
 			return err
 		}
-		t.files = append([]*fileMeta{meta}, t.files...)
+		t.files = append(slices.Clone(metas), t.files...)
 	}
 
 	walNum := nextFileNum
 	nextFileNum++
-	wal, err := createWAL(e.fs, e.dir, walNum)
+	wal, err := createWAL(e.fs, e.dir, walNum, 0, e.opts.WALSegmentSize)
 	if err != nil {
 		return err
 	}
@@ -636,6 +653,13 @@ func (e *Engine) periodicSync(period time.Duration) {
 type Metrics struct {
 	Flushes, Compactions         int64
 	BytesFlushed, BytesCompacted int64
+	// TombstoneCompactions counts single-sstable compactions run for
+	// droppable tombstones; ExpiredSSTablesDropped counts fully expired
+	// sstables deleted without being rewritten.
+	TombstoneCompactions, ExpiredSSTablesDropped int64
+	// EarlyReleasedInputs counts compaction inputs released before their
+	// compaction finished (FragmentSize).
+	EarlyReleasedInputs int64
 	// WriteAmplification is (flushed + compacted) / flushed bytes: how many
 	// times each flushed byte was written to sstables.
 	WriteAmplification float64
@@ -648,6 +672,10 @@ func (e *Engine) Metrics() Metrics {
 		Compactions:    e.metrics.compactions.Load(),
 		BytesFlushed:   e.metrics.bytesFlushed.Load(),
 		BytesCompacted: e.metrics.bytesCompacted.Load(),
+
+		TombstoneCompactions:   e.metrics.tombstoneCompactions.Load(),
+		ExpiredSSTablesDropped: e.metrics.expiredDropped.Load(),
+		EarlyReleasedInputs:    e.metrics.earlyReleases.Load(),
 	}
 	if m.BytesFlushed > 0 {
 		m.WriteAmplification = float64(m.BytesFlushed+m.BytesCompacted) / float64(m.BytesFlushed)
@@ -751,7 +779,17 @@ func (e *Engine) walBytesLocked() int64 {
 func (e *Engine) rotateWALLocked() error {
 	num := e.mu.nextFileNum
 	e.mu.nextFileNum++
-	wal, err := createWAL(e.fs, e.dir, num)
+	var recycle uint64
+	if len(e.mu.recycledWAL) > 0 {
+		recycle = e.mu.recycledWAL[0]
+		e.mu.recycledWAL = e.mu.recycledWAL[1:]
+	}
+	wal, err := createWAL(e.fs, e.dir, num, recycle, e.opts.WALSegmentSize)
+	if err != nil && recycle != 0 {
+		// Fall back to a new file; the old one is no longer needed.
+		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(recycle)))
+		wal, err = createWAL(e.fs, e.dir, num, 0, e.opts.WALSegmentSize)
+	}
 	if err == nil {
 		err = syncDir(e.fs, e.dir)
 	}
@@ -845,18 +883,32 @@ func (e *Engine) flushOne() error {
 	}
 	job := e.mu.flushQueue[0]
 	t, im := job.t, job.imm
-	num := e.mu.nextFileNum
-	e.mu.nextFileNum++
 	e.mu.Unlock()
 
-	meta, err := writeTable(e.fs, t.dir, num, e.writerOpts, e.merger, im.mem)
-	if err == nil && meta != nil {
-		err = e.openFile(t, meta)
+	alloc := func() uint64 {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.mu.nextFileNum++
+		return e.mu.nextFileNum - 1
+	}
+	metas, err := writeTable(e.fs, t.dir, alloc, e.writerOpts, e.merger, im.mem, t.flushBoundaries(im.mem), t.opts.fragmentSize(), t.timeSplitter(), e.opts.Now().Unix())
+	closeAll := func() {
+		for _, m := range metas {
+			if m.reader != nil {
+				m.reader.close()
+			}
+		}
+	}
+	for _, meta := range metas {
+		if err == nil {
+			err = e.openFile(t, meta)
+		}
 	}
 	if err == nil {
 		err = syncDir(e.fs, t.dir)
 	}
 	if err != nil {
+		closeAll()
 		if t.dropped.Load() {
 			// The table's directory may already be gone.
 			err = nil
@@ -871,33 +923,29 @@ func (e *Engine) flushOne() error {
 	dropped := t.dropped.Load()
 	edit := &versionEdit{nextFileNum: e.mu.nextFileNum, minWAL: e.minNeededWALLocked(im)}
 	if !dropped {
-		te := &tableEdit{id: t.id, flushedSeq: im.boundary}
-		if meta != nil {
-			te.added = []*fileMeta{meta}
-		}
-		edit.tables = []*tableEdit{te}
+		edit.tables = []*tableEdit{{id: t.id, flushedSeq: im.boundary, added: metas}}
 	}
 	manifest := e.mu.manifest
 	e.mu.Unlock()
 
 	if err := manifest.write(edit); err != nil {
-		if meta != nil {
-			meta.reader.close()
-		}
+		closeAll()
 		return err
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if t.dropped.Load() {
-		if meta != nil {
-			meta.reader.close()
-		}
+		closeAll()
 	} else {
-		if meta != nil {
-			t.files = append([]*fileMeta{meta}, t.files...)
-			t.observeFlushLocked(meta.size)
-			e.metrics.bytesFlushed.Add(int64(meta.size))
+		if len(metas) > 0 {
+			var size uint64
+			for _, m := range metas {
+				size += m.size
+			}
+			t.files = append(slices.Clone(metas), t.files...)
+			t.observeFlushLocked(size)
+			e.metrics.bytesFlushed.Add(int64(size))
 			e.metrics.flushes.Add(1)
 		}
 		t.flushedSeq = im.boundary
@@ -920,11 +968,22 @@ func (e *Engine) finishFlushLocked(job flushJob) {
 	e.mu.cond.Broadcast()
 }
 
-// deleteObsoleteWALLocked deletes WAL segments below minWAL. The manifest
-// already records that every table has flushed past them.
+// walRecycleLimit is the number of obsolete WAL segments kept for reuse.
+// Segments become obsolete about as fast as new ones are needed, so a small
+// pool suffices; more would only hold disk space.
+const walRecycleLimit = 2
+
+// deleteObsoleteWALLocked deletes WAL segments below minWAL, or keeps them
+// for reuse. The manifest already records, durably, that every table has
+// flushed past them, so recovery never replays them (it starts at minWAL)
+// and deletes any left over.
 func (e *Engine) deleteObsoleteWALLocked(minWAL uint64) {
 	for len(e.mu.walSegs) > 1 && e.mu.walSegs[0].num < minWAL {
-		_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))
+		if len(e.mu.recycledWAL) < walRecycleLimit {
+			e.mu.recycledWAL = append(e.mu.recycledWAL, e.mu.walSegs[0].num)
+		} else {
+			_ = e.fs.Remove(e.fs.PathJoin(e.dir, walFileName(e.mu.walSegs[0].num)))
+		}
 		e.closedWALBytes.Add(-e.mu.walSegs[0].size)
 		e.mu.walSegs = e.mu.walSegs[1:]
 	}
